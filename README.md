@@ -17,12 +17,15 @@ headless (Lite) and desktop.
 ## Usage
 
 ```bash
-export PNASYS_VERCEL_BASE="https://<your-vercel-app>.vercel.app"
 pnasyscrp setup      # fav restaurant/animal/color, pi user/pass, local pw
 pnasyscrp enable     # background listening server (systemd user unit, nohup fallback)
 pnasyscrp disable    # stop listener
 pnasyscrp revokeapi  # confirm YES -> deletes keys via Vercel API, setup again
 ```
+
+No export needed: the API base defaults to `https://pnasys-crp-api.vercel.app`
+and is saved at setup. Only set `PNASYS_VERCEL_BASE` if you point at a
+different deployment (e.g. a preview URL for testing).
 
 `enable`/`disable` require `setup` first. `revokeapi` requires confirmation
 and forces re-setup. The Pi identity blob is not recoverable via the package.
