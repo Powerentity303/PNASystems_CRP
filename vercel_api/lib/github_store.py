@@ -151,7 +151,9 @@ def get_file(owner_repo: str, path: str, token: str, branch: str = "main") -> by
         payload = json.loads(body)
         if isinstance(payload, list):
             return None
-        return base64.b64decode(payload["content"])
+        # File text is itself base64(raw) (single-part store); decode twice.
+        file_text = base64.b64decode(payload["content"]).decode("ascii")
+        return base64.b64decode(file_text)
     except Exception:
         return None
 
