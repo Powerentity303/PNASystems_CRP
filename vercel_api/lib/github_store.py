@@ -161,6 +161,17 @@ def get_file(owner_repo: str, path: str, token: str, branch: str = "main") -> by
 def delete_file(owner_repo: str, path: str, message: str, token: str,
                 branch: str = "main") -> bool:
     """Delete file (and any chunk parts). True if something was deleted."""
+
+    def _delete_one(p: str) -> bool:
+        sha = _get_sha(owner_repo, p, token, branch)
+        if not sha:
+            return False
+        st, resp = _call(f"{API}/repos/{owner_repo}/contents/{p}", token, method="DELETE",
+                         body={"message": message, "sha": sha, "branch": branch})
+        if st == 200:
+            return True
+        raise RuntimeError(f"DELETE {p}: HTTP {st} :: {_redact(resp)[:200]}")
+
     deleted = False
     # Chunked?
     st, body = _call(f"{API}/repos/{owner_repo}/contents/{path}.meta.json?ref={branch}", token)
@@ -171,21 +182,10 @@ def delete_file(owner_repo: str, path: str, message: str, token: str,
         except Exception:
             n = 0
         for i in range(n):
-            _delete_one(owner_repo, f"{path}.part{i:03d}", message, token, branch)
-        _delete_one(owner_repo, path + ".meta.json", message, token, branch)
+            _delete_one(f"{path}.part{i:03d}")
+        _delete_one(path + ".meta.json")
         deleted = True
-    return _delete_one(owner_repo, path, message, token, branch) or deleted
-
-
-def _delete_one(owner_repo: str, path: str, message: str, token: str, branch: str) -> bool:
-    sha = _get_sha(owner_repo, path, token, branch)
-    if not sha:
-        return False
-    st, resp = _call(f"{API}/repos/{owner_repo}/contents/{path}", token, method="DELETE",
-                     body={"message": message, "sha": sha, "branch": branch})
-    if st == 200:
-        return True
-    raise RuntimeError(f"DELETE {path}: HTTP {st} :: {_redact(resp)[:200]}")
+    return _delete_one(path) or deleted
 
 
 def list_dir(owner_repo: str, path: str, token: str, branch: str = "main") -> list[dict]:
