@@ -45,19 +45,33 @@ def _auth(token: str) -> dict:
 
 
 def _call(url: str, token: str, method: str = "GET", body: dict | None = None,
-          timeout: int = 30) -> tuple[int, str]:
+          timeout: int = 30, retries: int = 6) -> tuple[int, str]:
+    """GitHub request with retries on network errors, 5xx and 429.
+
+    4xx (except 429) is returned immediately — 404 means 'absent' in the
+    get/list/delete flows and must not be retried into existence.
+    """
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers=_auth(token))
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
+    last: Exception | None = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, method=method, headers=_auth(token))
         try:
-            return e.code, e.read().decode("utf-8", "replace")
-        except Exception:
-            return e.code, ""
-    except Exception as e:
-        raise RuntimeError(f"github request failed: {_redact(e)[:200]}") from None
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            if e.code == 429 or 500 <= e.code < 600:
+                last = RuntimeError(f"HTTP {e.code}")
+                time.sleep(min(20.0, 1.0 * (attempt + 1)))
+                continue
+            return e.code, detail
+        except Exception as e:
+            last = e
+            time.sleep(min(20.0, 1.0 * (attempt + 1)))
+    raise RuntimeError(f"github request failed after {retries}: {_redact(last)[:200]}")
 
 
 def _get_sha(owner_repo: str, path: str, token: str, branch: str) -> str | None:
