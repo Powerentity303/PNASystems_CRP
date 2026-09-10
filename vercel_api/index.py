@@ -139,15 +139,26 @@ def poll():
             _ = _check_registered_by_ident(cfg, ident)
         except LookupError:
             return jsonify({"error": "unknown ident"}), 403
-        entries = gs.list_dir(cfg["queue"], "queue", cfg["token"], cfg["qb"])
-        cands = [e["name"] for e in entries
-                 if e.get("type") == "file" and e["name"].startswith(ident + "-")
-                 and e["name"].endswith(".json")]
-        if not cands:
+        entries: list = []
+        name = ""
+        for _ in range(6):
+            entries = gs.list_dir(cfg["queue"], "queue", cfg["token"], cfg["qb"])
+            cands = [e["name"] for e in entries
+                     if e.get("type") == "file" and e["name"].startswith(ident + "-")
+                     and e["name"].endswith(".json")]
+            if cands:
+                cands.sort()  # ts-prefixed names sort oldest-first
+                name = cands[0]
+                break
+            time.sleep(4)
+        if not name:
             return jsonify({"empty": True})
-        cands.sort()  # ts-prefixed names sort oldest-first
-        name = cands[0]
-        raw = gs.get_file(cfg["queue"], f"queue/{name}", cfg["token"], cfg["qb"])
+        raw = None
+        for _ in range(4):
+            raw = gs.get_file(cfg["queue"], f"queue/{name}", cfg["token"], cfg["qb"])
+            if raw is not None:
+                break
+            time.sleep(3)
         if raw is None:
             return jsonify({"empty": True})
         try:
