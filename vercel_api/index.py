@@ -1,7 +1,7 @@
 """PNASystems CRP main API (Flask, Vercel Python runtime).
 
 Vercel detects this via `Flask` in requirements + this `index.py`
-entrypoint (project rootDirectory = vercel_api/).
+entrypoint at the deployment root (no git link; deployed by file upload).
 
 Env (server-side only; GITHUB_TOKEN stored as Sensitive):
   GITHUB_TOKEN, KEY_REPO (private #1, key DB), QUEUE_REPO (private #2),
@@ -148,10 +148,16 @@ def poll():
         cands.sort()  # ts-prefixed names sort oldest-first
         name = cands[0]
         raw = gs.get_file(cfg["queue"], f"queue/{name}", cfg["token"], cfg["qb"])
-        gs.delete_file(cfg["queue"], f"queue/{name}", f"claim {name}", cfg["token"], cfg["qb"])
         if raw is None:
             return jsonify({"empty": True})
-        return jsonify(json.loads(raw.decode()))
+        try:
+            job = json.loads(raw.decode())
+        except Exception:
+            # Corrupt payload: drop it so the queue never wedges on one file.
+            gs.delete_file(cfg["queue"], f"queue/{name}", f"drop {name}", cfg["token"], cfg["qb"])
+            return jsonify({"empty": True})
+        gs.delete_file(cfg["queue"], f"queue/{name}", f"claim {name}", cfg["token"], cfg["qb"])
+        return jsonify(job)
     except Exception as e:
         return jsonify({"error": _redact(e)[:200]}), 500
 
