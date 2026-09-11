@@ -34,7 +34,7 @@ STATE = SAFE_DIR / "state.json"
 PIDFILE = SAFE_DIR / "listener.pid"
 ENVFILE = VAULT / "listener.env"  # PNASYS_PW=..., mode 600 (user service only)
 LAST_EVENT = SAFE_DIR / "last_event"  # unix ts of last claimed job / enable
-SECURE_FILE = VAULT / "secure.enc.json"  # channel key, AES-GCM (never printed)
+SESSION_FILE = VAULT / "session.key"  # enable-time session key, 600
 
 
 def _vercel_base() -> str:
@@ -59,19 +59,36 @@ def _idle_for() -> float:
         return 0.0
 
 
-def _load_channel_key() -> str | None:
-    """Decrypt the setup channel key using the service password (env)."""
-    pw = os.environ.get("PNASYS_PW", "")
-    if not pw or not SECURE_FILE.exists():
-        return None
+def _load_session_key() -> str | None:
+    """Read the enable-time session key (600 file, Pi-local)."""
     try:
-        from .crypto_local import decrypt_local
-    except ImportError:
-        from pnasystems_crp.crypto_local import decrypt_local  # type: ignore[no-redef]
-    try:
-        return decrypt_local(json.loads(SECURE_FILE.read_text()), pw).decode()
+        key = SESSION_FILE.read_text().strip()
+        return key or None
     except Exception:
         return None
+
+
+def _pack_response(session_key: str, resp: dict) -> dict:
+    """Encrypt a response dict with pnasys under the session key.
+
+    Vercel stores/transports this blob opaquely; only the MCP side (which
+    holds the same session key) can decrypt it. Large reads are encrypted
+    as base64 inside the same envelope — GitHub chunking + result
+    streaming already handle arbitrary sizes downstream.
+    """
+    import base64 as _b64
+    import json as _json
+
+    try:
+        from .crypto_local import secure_pack
+    except ImportError:
+        from pnasystems_crp.crypto_local import secure_pack  # type: ignore[no-redef]
+    raw = resp.pop("_stream_raw", None)
+    if raw is not None:
+        resp = dict(resp)
+        resp["data_b64"] = _b64.b64encode(raw).decode("ascii")
+        resp["stream"] = True
+    return {"id": resp.get("id", ""), "enc": secure_pack(session_key, resp)}
 
 
 def _run_exec(msg: dict) -> dict:
@@ -126,22 +143,26 @@ def _dispatch(msg: dict) -> dict | None:
     if kind == "install":
         return _run_install(msg)
     if kind == "secure":
-        key = _load_channel_key()
-        if key is None:
-            return {"id": msg.get("id", ""), "error": "no channel key on pi"}
+        session = _load_session_key()
+        if session is None:
+            return {"id": msg.get("id", ""), "error": "no session key on pi (re-run enable)"}
         try:
             try:
-                from .crypto_local import secure_unpack
+                from .crypto_local import secure_pack, secure_unpack
             except ImportError:
-                from pnasystems_crp.crypto_local import secure_unpack  # type: ignore[no-redef]
-            op = secure_unpack(key, str(msg.get("blob", "")))
+                from pnasystems_crp.crypto_local import secure_pack, secure_unpack  # type: ignore[no-redef]
+            op = secure_unpack(session, str(msg.get("blob", "")))
         except Exception:
             return {"id": msg.get("id", ""), "error": "secure decrypt failed"}
         if not isinstance(op, dict) or op.get("kind") in (None, "secure"):
             return {"id": msg.get("id", ""), "error": "bad secure op"}
         op = dict(op)
         op["id"] = msg.get("id", "")
-        return _dispatch(op)
+        resp = _dispatch(op)
+        if resp is None:
+            return {"id": msg.get("id", ""), "error": "unsupported op"}
+        # Pi encrypts its response: Vercel stores it blind, MCP decrypts it.
+        return _pack_response(session, resp)
     return None
 
 
