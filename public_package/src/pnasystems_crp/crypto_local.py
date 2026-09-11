@@ -125,3 +125,26 @@ def decrypt_local(bundle: dict, password: str) -> bytes:
     nonce = base64.b64decode(bundle["nonce_b64"])
     ct = base64.b64decode(bundle["ct_b64"])
     return AESGCM(key).decrypt(nonce, ct, None)
+
+
+def secure_pack(channel_key: str, op: dict) -> str:
+    """Encrypt an op dict with pnasys-encryption-service. Returns the token.
+
+    The MCP side calls this with the AI-supplied encryption key; the Pi
+    decrypts it with the channel key from setup. Compact JSON keeps queue
+    files small.
+    """
+    import json as _json
+
+    from pnasys_encryption_service import EncryptString
+
+    return EncryptString(_json.dumps(op, separators=(",", ":")), channel_key)
+
+
+def secure_unpack(channel_key: str, token: str) -> dict:
+    """Inverse of secure_pack. Raises on wrong key / tampered token."""
+    import json as _json
+
+    from pnasys_encryption_service import DecryptString
+
+    return _json.loads(DecryptString(token, channel_key))
