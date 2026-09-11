@@ -26,6 +26,8 @@ STATE = SAFE_DIR / "state.json"
 CREDS_TXT = VAULT / "creds.txt"  # username + password, perms 600
 PI_BLOB_FILE = VAULT / "pi_blob.ref"
 ACCESS_FILE = VAULT / "access.enc.json"  # AES-GCM encrypted access key (never printed)
+SECURE_FILE = VAULT / "secure.enc.json"  # AES-GCM encrypted channel key (never printed)
+SESSION_FILE = VAULT / "session.key"  # last enable-time session key, 600
 
 
 def _ensure_dirs() -> None:
@@ -73,7 +75,8 @@ def cmd_setup(vercel_base: str) -> int:
     pi_user = input("Raspberry Pi username: ").strip()
     pi_pass = getpass.getpass("Raspberry Pi password: ")
     enc_password = getpass.getpass("Local encryption password (anything): ")
-    if not all([fav_rest, fav_animal, fav_color, pi_user, pi_pass, enc_password]):
+    channel_key = getpass.getpass("Secure channel key (shared with your AI/MCP): ")
+    if not all([fav_rest, fav_animal, fav_color, pi_user, pi_pass, enc_password, channel_key]):
         print("All fields required.", file=sys.stderr)
         return 2
 
@@ -101,12 +104,14 @@ def cmd_setup(vercel_base: str) -> int:
     _ = fav_animal  # collected per spec; reserved for future key math
     _ = make_access_sha1024(pi_blob, uuid1, fav_color, fav_rest)  # local pi identity ref
 
-    # 4) Encrypt access key locally so enable/disable work without re-prompt;
-    #    never print it.
+    # 4) Encrypt access key + channel key locally so enable/disable work
+    #    without re-prompt; never print either.
     enc_bundle = encrypt_local(access_key.encode(), enc_password)
     ACCESS_FILE.write_text(json.dumps(enc_bundle))
+    SECURE_FILE.write_text(json.dumps(encrypt_local(channel_key.encode(), enc_password)))
     try:
         os.chmod(ACCESS_FILE, 0o600)
+        os.chmod(SECURE_FILE, 0o600)
     except Exception:
         pass
 
@@ -145,10 +150,21 @@ def cmd_enable() -> int:
         from .daemon import start_daemon
     except ImportError:  # installed-layout fallback
         from pnasystems_crp.daemon import start_daemon  # type: ignore[no-redef]
+    try:
+        from .keygen import generate_session_key
+    except ImportError:  # installed-layout fallback
+        from pnasystems_crp.keygen import generate_session_key  # type: ignore[no-redef]
 
     _require_setup()
     _access_key, pw = _load_access_key()  # never printed
     del _access_key  # daemon_run reloads from vault; keep secret out of argv/ps
+    session_key = generate_session_key()
+    try:
+        SESSION_FILE.write_text(session_key + "\n")
+        os.chmod(SESSION_FILE, 0o600)
+    except Exception:
+        pass
+    print("Session key: " + session_key)
     return start_daemon(pw)
 
 
@@ -185,7 +201,7 @@ def cmd_revokeapi(vercel_base: str) -> int:
         return 1
     # Force setup again.
     _save_state({"setup_done": False, "vercel_base": vercel_base})
-    for f in (ACCESS_FILE, PI_BLOB_FILE, CREDS_TXT):
+    for f in (ACCESS_FILE, PI_BLOB_FILE, CREDS_TXT, SECURE_FILE, SESSION_FILE):
         try:
             if f.exists():
                 f.unlink()
@@ -212,7 +228,21 @@ def cmd_selftest() -> int:
     ek = derive_pi_encryption_key(access)
     assert len(ek.split("-")) == 4
     assert sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    print("selftest OK: AES-GCM round-trip, pi blob, SHA1024, pi-key derivation")
+    try:
+        from .keygen import generate_session_key
+    except ImportError:
+        from pnasystems_crp.keygen import generate_session_key  # type: ignore[no-redef]
+    sk = generate_session_key()
+    parts = sk.split("=")
+    assert len(parts) == 6 and all(len(p) == 64 for p in parts)
+    assert parts[0] == parts[5][::-1] and parts[1] == parts[4][::-1]
+    assert parts[2] == parts[3][::-1]
+    from .crypto_local import secure_pack, secure_unpack
+
+    blob = secure_pack("chan-key", {"kind": "exec", "cmd": "echo hi"})
+    assert secure_unpack("chan-key", blob) == {"kind": "exec", "cmd": "echo hi"}
+    print("selftest OK: AES-GCM round-trip, pi blob, SHA1024, pi-key derivation,")
+    print("  session-key shape (H1=H2=H3=rH3=rH2=rH1), secure pack/unpack")
     return 0
 
 
