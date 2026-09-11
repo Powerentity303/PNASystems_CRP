@@ -10,7 +10,8 @@ Env (server-side only; GITHUB_TOKEN stored as Sensitive):
 Routes:
   GET  /api/health
   POST /api/register  {pi_blob, access_key}
-  POST /api/request   {access_key, kind, cmd|path|data_b64|pkg, id?}
+  POST /api/request   {access_key, kind, cmd|path|data_b64|pkg|blob, id?}
+                        kind=secure carries an opaque pnasys-encrypted op blob
   GET  /api/poll?ident=            -> oldest queued request (claimed+deleted)
   POST /api/respond   {ident, id, ...result...}
   POST /api/stream    {ident, id, seq, data_b64, last}
