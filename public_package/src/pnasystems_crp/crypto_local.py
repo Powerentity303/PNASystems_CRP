@@ -127,24 +127,24 @@ def decrypt_local(bundle: dict, password: str) -> bytes:
     return AESGCM(key).decrypt(nonce, ct, None)
 
 
-def secure_pack(channel_key: str, op: dict) -> str:
-    """Encrypt an op dict with pnasys-encryption-service. Returns the token.
+def secure_pack(session_key: str, op: dict) -> str:
+    """Encrypt an op/response dict with pnasys-encryption-service.
 
-    The MCP side calls this with the AI-supplied encryption key; the Pi
-    decrypts it with the channel key from setup. Compact JSON keeps queue
-    files small.
+    The session key (printed at `pnasyscrp enable`) is the transport key:
+    MCP packs requests with it, the Pi unpacks; the Pi packs responses
+    with it, MCP unpacks. Vercel only ever stores the opaque token.
     """
     import json as _json
 
     from pnasys_encryption_service import EncryptString
 
-    return EncryptString(_json.dumps(op, separators=(",", ":")), channel_key)
+    return EncryptString(_json.dumps(op, separators=(",", ":")), session_key)
 
 
-def secure_unpack(channel_key: str, token: str) -> dict:
+def secure_unpack(session_key: str, token: str) -> dict:
     """Inverse of secure_pack. Raises on wrong key / tampered token."""
     import json as _json
 
     from pnasys_encryption_service import DecryptString
 
-    return _json.loads(DecryptString(token, channel_key))
+    return _json.loads(DecryptString(token, session_key))
