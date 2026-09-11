@@ -23,10 +23,9 @@ HOME = Path.home()
 SAFE_DIR = HOME / ".pnasys_crp"
 VAULT = SAFE_DIR / ".vault"
 STATE = SAFE_DIR / "state.json"
-CREDS_TXT = VAULT / "creds.txt"  # username + password, perms 600
+CREDS_TXT = VAULT / "creds.txt"  # AES-GCM encrypted "user\npass" bundle, 600
 PI_BLOB_FILE = VAULT / "pi_blob.ref"
 ACCESS_FILE = VAULT / "access.enc.json"  # AES-GCM encrypted access key (never printed)
-SECURE_FILE = VAULT / "secure.enc.json"  # AES-GCM encrypted channel key (never printed)
 SESSION_FILE = VAULT / "session.key"  # last enable-time session key, 600
 
 
@@ -75,16 +74,16 @@ def cmd_setup(vercel_base: str) -> int:
     pi_user = input("Raspberry Pi username: ").strip()
     pi_pass = getpass.getpass("Raspberry Pi password: ")
     enc_password = getpass.getpass("Local encryption password (anything): ")
-    channel_key = getpass.getpass("Secure channel key (shared with your AI/MCP): ")
-    if not all([fav_rest, fav_animal, fav_color, pi_user, pi_pass, enc_password, channel_key]):
+    if not all([fav_rest, fav_animal, fav_color, pi_user, pi_pass, enc_password]):
         print("All fields required.", file=sys.stderr)
         return 2
 
     # Key/IV derivation check (password -> key + iv/salt).
     _key, _iv_seed = derive_key_iv(enc_password)
 
-    # 1) Save username/password txt FIRST (plaintext, 600 perms).
-    CREDS_TXT.write_text(f"{pi_user}\n{pi_pass}\n")
+    # 1) Save username/password AES-256-GCM encrypted (key/IV derived from
+    #    the password's hashes), 600 perms. Never plaintext on disk.
+    CREDS_TXT.write_text(json.dumps(encrypt_local(f"{pi_user}\n{pi_pass}\n".encode(), enc_password)))
     try:
         os.chmod(CREDS_TXT, 0o600)
     except Exception:
@@ -104,14 +103,12 @@ def cmd_setup(vercel_base: str) -> int:
     _ = fav_animal  # collected per spec; reserved for future key math
     _ = make_access_sha1024(pi_blob, uuid1, fav_color, fav_rest)  # local pi identity ref
 
-    # 4) Encrypt access key + channel key locally so enable/disable work
-    #    without re-prompt; never print either.
+    # 4) Encrypt access key locally so enable/disable work without re-prompt;
+    #    never print it.
     enc_bundle = encrypt_local(access_key.encode(), enc_password)
     ACCESS_FILE.write_text(json.dumps(enc_bundle))
-    SECURE_FILE.write_text(json.dumps(encrypt_local(channel_key.encode(), enc_password)))
     try:
         os.chmod(ACCESS_FILE, 0o600)
-        os.chmod(SECURE_FILE, 0o600)
     except Exception:
         pass
 
@@ -201,7 +198,7 @@ def cmd_revokeapi(vercel_base: str) -> int:
         return 1
     # Force setup again.
     _save_state({"setup_done": False, "vercel_base": vercel_base})
-    for f in (ACCESS_FILE, PI_BLOB_FILE, CREDS_TXT, SECURE_FILE, SESSION_FILE):
+    for f in (ACCESS_FILE, PI_BLOB_FILE, CREDS_TXT, SESSION_FILE):
         try:
             if f.exists():
                 f.unlink()
