@@ -34,7 +34,7 @@ from lib.crypto_server import decrypt_pi_blob, encrypt_pi_blob, ident_for
 
 app = Flask(__name__)
 
-KINDS = ("exec", "read", "write", "install")
+KINDS = ("exec", "read", "write", "install", "secure")
 
 
 def _redact(s: object) -> str:
@@ -117,6 +117,10 @@ def make_request():
             job["data_b64"] = str(data.get("data_b64", ""))
         elif kind == "install":
             job["pkg"] = str(data.get("pkg", ""))[:256]
+        elif kind == "secure":
+            # Opaque pnasys-encrypted op; server never inspects it. The Pi
+            # decrypts it with the setup channel key.
+            job["blob"] = str(data.get("blob", ""))
         fname = f"queue/{ident}-{int(time.time() * 1000)}-{gs.rand7()}.json"
         gs.put_file(cfg["queue"], fname, json.dumps(job).encode(),
                     f"enqueue {rid}", cfg["token"], cfg["qb"])
