@@ -5,6 +5,12 @@ enable  -> systemd user service (or nohup fallback), polls queue repo for
            supports 'prepare for stream' + chunked stream API.
 disable -> stops the service.
 
+Idle rule: if no new event is claimed for 10 minutes, the listener
+disables itself (stop_daemon) and exits.
+
+Secure jobs (kind "secure", opaque pnasys-encrypted blob) are decrypted
+with the channel key from setup; the plaintext op never leaves the Pi.
+
 Poll loop never prints the access key. Reconnects with backoff on errors.
 """
 from __future__ import annotations
@@ -20,12 +26,15 @@ import urllib.request
 from pathlib import Path
 
 SERVICE_NAME = "pnasyscrp-listener"
+IDLE_SECONDS = 600
 HOME = Path.home()
 SAFE_DIR = HOME / ".pnasys_crp"
 VAULT = SAFE_DIR / ".vault"
 STATE = SAFE_DIR / "state.json"
 PIDFILE = SAFE_DIR / "listener.pid"
 ENVFILE = VAULT / "listener.env"  # PNASYS_PW=..., mode 600 (user service only)
+LAST_EVENT = SAFE_DIR / "last_event"  # unix ts of last claimed job / enable
+SECURE_FILE = VAULT / "secure.enc.json"  # channel key, AES-GCM (never printed)
 
 
 def _vercel_base() -> str:
@@ -36,65 +45,139 @@ def _vercel_base() -> str:
         return os.environ.get("PNASYS_VERCEL_BASE", "")
 
 
-def _poll_once(access_key: str, base: str) -> None:
-    # Identify as sha256(access_key); server maps to queue files
-    # named <hash>-<rand7>.json (rand suffix avoids same-name collisions).
+def _touch_event() -> None:
+    try:
+        LAST_EVENT.write_text(str(int(time.time())))
+    except Exception:
+        pass
+
+
+def _idle_for() -> float:
+    try:
+        return time.time() - int(LAST_EVENT.read_text().strip())
+    except Exception:
+        return 0.0
+
+
+def _load_channel_key() -> str | None:
+    """Decrypt the setup channel key using the service password (env)."""
+    pw = os.environ.get("PNASYS_PW", "")
+    if not pw or not SECURE_FILE.exists():
+        return None
+    try:
+        from .crypto_local import decrypt_local
+    except ImportError:
+        from pnasystems_crp.crypto_local import decrypt_local  # type: ignore[no-redef]
+    try:
+        return decrypt_local(json.loads(SECURE_FILE.read_text()), pw).decode()
+    except Exception:
+        return None
+
+
+def _run_exec(msg: dict) -> dict:
+    out = subprocess.run(msg.get("cmd", "echo ok"), shell=True, capture_output=True,
+                         text=True, timeout=120)
+    return {"id": msg.get("id", ""), "rc": out.returncode,
+            "out": out.stdout[-20000:], "err": out.stderr[-20000:]}
+
+
+def _run_read(msg: dict) -> dict:
+    rid = msg.get("id", "")
+    p = Path(msg.get("path", ""))
+    try:
+        raw = p.read_bytes()
+    except Exception as e:
+        return {"id": rid, "error": f"read failed: {e}"}
+    if len(raw) > 5_000_000:
+        return {"id": rid, "stream": True, "note": "prepare for stream",
+                "_stream_raw": raw}
+    return {"id": rid, "ok": True, "data_b64": base64.b64encode(raw).decode()}
+
+
+def _run_write(msg: dict) -> dict:
+    rid = msg.get("id", "")
+    p = Path(msg.get("path", "/tmp/pnasys_out.bin"))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    raw = base64.b64decode(msg.get("data_b64", "")) if msg.get("data_b64") else b""
+    p.write_bytes(raw)
+    return {"id": rid, "ok": True, "path": str(p), "bytes": len(raw)}
+
+
+def _run_install(msg: dict) -> dict:
+    rid = msg.get("id", "")
+    pkg = "".join(c for c in str(msg.get("pkg", "")) if c.isalnum() or c in "-+._")
+    if not pkg:
+        return {"id": rid, "error": "empty package"}
+    out = subprocess.run(["sudo", "apt-get", "install", "-y", pkg],
+                         capture_output=True, text=True, timeout=600)
+    return {"id": rid, "rc": out.returncode,
+            "out": out.stdout[-20000:], "err": out.stderr[-20000:]}
+
+
+def _dispatch(msg: dict) -> dict | None:
+    """Route a job to its handler. Returns response dict, or None to skip."""
+    kind = msg.get("kind", "")
+    if kind == "exec":
+        return _run_exec(msg)
+    if kind == "read":
+        return _run_read(msg)
+    if kind == "write":
+        return _run_write(msg)
+    if kind == "install":
+        return _run_install(msg)
+    if kind == "secure":
+        key = _load_channel_key()
+        if key is None:
+            return {"id": msg.get("id", ""), "error": "no channel key on pi"}
+        try:
+            try:
+                from .crypto_local import secure_unpack
+            except ImportError:
+                from pnasystems_crp.crypto_local import secure_unpack  # type: ignore[no-redef]
+            op = secure_unpack(key, str(msg.get("blob", "")))
+        except Exception:
+            return {"id": msg.get("id", ""), "error": "secure decrypt failed"}
+        if not isinstance(op, dict) or op.get("kind") in (None, "secure"):
+            return {"id": msg.get("id", ""), "error": "bad secure op"}
+        op = dict(op)
+        op["id"] = msg.get("id", "")
+        return _dispatch(op)
+    return None
+
+
+def _poll_once(access_key: str, base: str) -> bool:
+    """Poll once. Returns True if an event was claimed (resets idle timer)."""
     ident = hashlib.sha256(access_key.encode()).hexdigest()
     url = base.rstrip("/") + f"/api/poll?ident={ident}"
     try:
-        with urllib.request.urlopen(url, timeout=25) as r:
+        with urllib.request.urlopen(url, timeout=40) as r:
             msg = json.loads(r.read().decode())
     except Exception:
-        return
+        return False
     if not msg or msg.get("empty"):
-        return
-    req_id = msg.get("id", "")
-    kind = msg.get("kind", "")
+        return False
+    _touch_event()
     try:
-        if kind == "exec":
-            out = subprocess.run(
-                msg.get("cmd", "echo ok"),
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            _respond(base, ident, {"id": req_id, "rc": out.returncode,
-                                   "out": out.stdout[-20000:], "err": out.stderr[-20000:]})
-        elif kind == "read":
-            p = Path(msg.get("path", ""))
-            try:
-                raw = p.read_bytes()
-            except Exception as e:
-                _respond(base, ident, {"id": req_id, "error": f"read failed: {e}"})
-                return
-            if len(raw) > 5_000_000:
-                _respond(base, ident, {"id": req_id, "stream": True, "note": "prepare for stream"})
-                _stream_back(base, ident, req_id, raw)
-            else:
-                _respond(base, ident, {"id": req_id, "ok": True,
-                                       "data_b64": base64.b64encode(raw).decode()})
-        elif kind == "write":
-            p = Path(msg.get("path", "/tmp/pnasys_out.bin"))
-            p.parent.mkdir(parents=True, exist_ok=True)
-            data = msg.get("data_b64", "")
-            raw = base64.b64decode(data) if data else b""
-            p.write_bytes(raw)
-            _respond(base, ident, {"id": req_id, "ok": True, "path": str(p),
-                                   "bytes": len(raw)})
-        elif kind == "install":
-            pkg = "".join(c for c in str(msg.get("pkg", "")) if c.isalnum() or c in "-+._")
-            if not pkg:
-                _respond(base, ident, {"id": req_id, "error": "empty package"})
-                return
-            out = subprocess.run(
-                ["sudo", "apt-get", "install", "-y", pkg],
-                capture_output=True, text=True, timeout=600,
-            )
-            _respond(base, ident, {"id": req_id, "rc": out.returncode,
-                                   "out": out.stdout[-20000:], "err": out.stderr[-20000:]})
+        resp = _dispatch(msg)
+        if resp is None:
+            return True
+        if resp.pop("_stream_raw", None) is not None:
+            raw = resp.pop("_stream_raw")
+            _respond(base, ident, {"id": resp.get("id", ""), "stream": True,
+                                   "note": "prepare for stream"})
+            _stream_back(base, ident, str(resp.get("id", "")), raw)
+            return True
+        # read-op large payloads use the same stream handshake
+        if msg.get("kind") == "read" and resp.get("data_b64") and len(resp["data_b64"]) > 6_000_000:
+            raw = base64.b64decode(resp["data_b64"])
+            _respond(base, ident, {"id": resp.get("id", ""), "stream": True,
+                                   "note": "prepare for stream"})
+            _stream_back(base, ident, str(resp.get("id", "")), raw)
+            return True
+        _respond(base, ident, resp)
     except Exception:
-        return
+        pass
+    return True
 
 
 def _respond(base: str, ident: str, payload: dict) -> None:
@@ -136,13 +219,17 @@ def run_forever(access_key: str) -> None:
             time.sleep(backoff)
             backoff = min(120, backoff * 2)
             continue
+        if _idle_for() > IDLE_SECONDS:
+            try:
+                stop_daemon()
+            finally:
+                sys.exit(0)
         time.sleep(5)
 
 
 def _write_env_file(pw: str) -> None:
     VAULT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Quote for systemd EnvironmentFile (KEY=val, no spaces in pw handling).
-    ENVFILE.write_text(f'PNASYS_PW={pw}\n')
+    ENVFILE.write_text(f"PNASYS_PW={pw}\n")
     try:
         os.chmod(ENVFILE, 0o600)
     except Exception:
@@ -152,6 +239,7 @@ def _write_env_file(pw: str) -> None:
 def start_daemon(pw: str) -> int:
     """Start listener. pw unlocks the vault for the background service."""
     _write_env_file(pw)
+    _touch_event()
     unit = (
         "[Unit]\n"
         "Description=PNASystems CRP listener (Pi 4/5)\n"
