@@ -279,6 +279,38 @@ def run_forever() -> None:
     _loop(access, pw, base)
 
 
+def _watch_join(pi_ident: str, link: dict) -> None:
+    """Claim a computer join, verify it, post the session ack.
+
+    Verifies (CHECK-3): blob decrypts with the link key, computer_id matches
+    the link record, timestamp is fresh (anti-replay). The ack proves Pi-side
+    key possession without revealing the key.
+    """
+    import urllib.request as _url
+
+    url = L.base().rstrip("/") + f"/api/ssh/wait?pi_ident={pi_ident}"
+    try:
+        with _url.urlopen(url, timeout=65) as r:
+            join = json.loads(r.read().decode())
+    except Exception:
+        return
+    if not join or join.get("empty"):
+        return
+    _touch()
+    try:
+        inner = secure_unpack(link["link_key"], join["blob"])
+        assert inner.get("computer_id") == link["computer_id"]
+        assert abs(int(time.time()) - int(inner.get("ts", 0))) <= 300
+        nonce = str(inner["nonce"])
+    except Exception:
+        return
+    try:
+        L.ssh_ack_post(pi_ident, L.session_ack(nonce, link["link_key"]))
+        print(f"Session verified for computer {link['computer_id'][:8]}...")
+    except Exception:
+        pass
+
+
 def run_ssh_presence(pw: str) -> int:
     from pnasyscnct.common import decrypt_local
 
@@ -290,9 +322,30 @@ def run_ssh_presence(pw: str) -> int:
         print("Not linked.", file=sys.stderr)
         return 2
     pi_ident = hashlib.sha256(access.encode()).hexdigest()
-    print("Announcing presence; queue listener active.")
-    _loop(access, pw, base,
-          heartbeat={"pi_ident": pi_ident, "key": link["link_key"]})
+    print("Announcing presence; join-watch + queue listener active.")
+    backoff, ticks = 5, 0
+    while True:
+        try:
+            _poll_once(access, pw, base)
+            backoff = 5
+        except Exception:
+            time.sleep(backoff)
+            backoff = min(120, backoff * 2)
+            continue
+        ticks += 1
+        if ticks % 6 == 0:
+            try:
+                L.ssh_hello(pi_ident, secure_pack(link["link_key"],
+                                                  {"hb": int(time.time())}))
+            except Exception:
+                pass
+            _watch_join(pi_ident, link)
+        if _idle() > IDLE_SECONDS:
+            try:
+                stop_daemon()
+            finally:
+                sys.exit(0)
+        time.sleep(5)
     return 0
 
 
