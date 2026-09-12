@@ -1,42 +1,47 @@
-# PNASystems_CRP (`pnasyscrp`) — Pi 4/5, headless + desktop
+# pnasyscnct — tailscale-style Pi remote (computer + Pi)
 
-Public package. Command is `pnasyscrp`, install name `PNASystems_CRP`.
-
-## Install via GitHub (no package-registry verification needed)
+One package, both ends. Install on Windows 11 (TPM 2.0) and on Pi 4/5
+(Raspberry Pi OS, headless or desktop) — via pip or via GitHub, identical:
 
 ```bash
+pip install pnasyscnct
+# or:
+pip install git+https://github.com/Powerentity303/PNASystems_CRP.git
+# or the one-liner (venv-safe on Pi OS):
 curl -fsSL https://raw.githubusercontent.com/Powerentity303/PNASystems_CRP/main/installer.sh | bash
-# or pinned:
-# curl -fsSL https://raw.githubusercontent.com/Powerentity303/PNASystems_CRP/v0.1.0/installer.sh | bash
 ```
 
-The installer clones this repo, installs `PNASystems_CRP` with pip, and puts
-`pnasyscrp` on PATH. Works on Raspberry Pi OS (64-bit) on Pi 4 and Pi 5,
-headless (Lite) and desktop.
+This gives you **both** commands: `pnasyscnct` (computer) and `pnasyscrp` (Pi).
 
-## Usage
+## Computer
 
 ```bash
-pnasyscrp setup      # restaurant/animal/color, pi user/pass, local pw, channel key
-pnasyscrp enable     # listener on + prints session key (keygen, H1=H2=H3=rH3=rH2=rH1)
-pnasyscrp disable    # stop listener
-pnasyscrp revokeapi  # confirm YES -> deletes keys via Vercel API, setup again
-pnasyscrp selftest   # offline crypto check (no network)
+pnasyscnct setup            # same questions + TPM-sealed vault, prints computer ID
+pnasyscnct setup --ssh      # scan for the Pi's pairing request, verify, rotate link key
+pnasyscnct ssh              # remote shell (reconnects on loss)
+pnasyscnct mcp --enckey K   # MCP server (OpenCode), SSH always active
 ```
 
-No export needed: the API base defaults to `https://pnasys-crp-api.vercel.app`
-and is saved at setup. Only set `PNASYS_VERCEL_BASE` if you point at a
-different deployment (e.g. a preview URL for testing).
+OpenCode (`opencode.json`):
 
-`enable` asks for the password you set at setup (unlocks the vault), then
-prints a fresh session key. The listener **auto-disables after 10 minutes
-with no new event**. `enable`/`disable` require `setup` first. `revokeapi`
-requires confirmation and forces re-setup. The Pi identity blob is not
-recoverable via the package.
+```json
+{"mcp": {"pnasys-ssh": {"type": "local",
+  "command": ["pnasyscnct", "mcp", "--enckey", "LINK_KEY"],
+  "enabled": true}}}
+```
 
-AI access: install `pnasys-crp-mcp` (`pip install pnasys-crp-mcp` or
-`uvx pnasys-crp-mcp`) and add it to OpenCode — the AI passes your api key +
-channel key per call; ops travel encrypted, the Pi decrypts them.
+## Pi
 
-`enable`/`disable` require `setup` first. `revokeapi` requires confirmation
-and forces re-setup. The Pi identity blob is not recoverable via the package.
+```bash
+pnasyscrp setup             # identity + AES vault, prints access key
+pnasyscrp enable            # listener + fresh session key (10-min idle auto-off)
+pnasyscrp ssh setup         # pairing: key first, code issued, enter computer ID
+pnasyscrp ssh enable        # presence + listener (root-aware exec)
+pnasyscrp update            # reinstall latest (cache-busted)
+```
+
+Linking in short: computer `setup --ssh` scans → Pi `ssh setup` sends an
+encrypted pairing code to that computer ID → computer verifies with the
+pairing key, both adopt a fresh link key → Pi verifies the answer the same
+way. Vercel only relays opaque blobs. Pi exec runs root-aware (`sudo -n`
+when not uid 0).
