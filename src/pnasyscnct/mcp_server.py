@@ -1,14 +1,14 @@
 """MCP server for pnasyscnct — stdio, stdlib-only transport (no mcp dep).
 
-Launched as: pnasyscnct mcp --enckey "<link key>" [--pi-ident X] [--computer-id Y]
-The link key comes from pairing; pi/computer ids default from link state.
-SSH session is (re)established automatically and kept active with reconnects.
+Launched as: pnasyscnct mcp --enckey "<link key>" --sshdev "<device>"
+Keys live at launch (link key flag, device ids from link state); tool calls
+carry only op arguments. SSH session is (re)established automatically and
+kept active with reconnects. NEVER write to stdout except protocol replies.
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import logging
 import sys
@@ -25,51 +25,35 @@ PI_IDENT = ""
 COMPUTER_ID = ""
 
 
-def _ident() -> str:
-    return PI_IDENT or L.load_state().get("pi_ident", "")
-
-
 def _send(op: dict, rid: str | None = None) -> dict:
     rid = rid or f"mcp{int(time.time() * 1000)}"
     blob = secure_pack(LINK_KEY, op)
     return L.api("POST", "/api/request",
-                 {"access_key": f"ident:{_ident()}", "kind": "secure",
+                 {"access_key": f"ident:{PI_IDENT}", "kind": "secure",
                   "blob": blob, "id": rid})
 
 
-def _wait(rid: str, wait_s: int) -> dict:
+def _collect(rid: str, wait_s: int) -> str:
     deadline = time.time() + max(5, min(wait_s, 300))
     while time.time() < deadline:
-        r = L.fetch_result(_ident(), rid)
-        if not r.get("pending"):
-            return r
-        time.sleep(5)
-    return {"pending": True, "timeout": True, "id": rid}
-
-
-def _collect(rid: str, wait_s: int) -> str:
-    r = _wait(rid, wait_s)
-    if r.get("pending"):
-        return json.dumps({"ok": False, "stage": "timeout", "id": rid,
-                           "hint": "use ssh_status / fetch again later"})
-    if r.get("_http_error") or "enc" not in r:
-        return json.dumps({"ok": False, "stage": "result", "error": "bad envelope"})
-    try:
-        inner = secure_unpack(LINK_KEY, str(r["enc"]))
-    except Exception:
-        return json.dumps({"ok": False, "stage": "decrypt", "error": "wrong link key?"})
-    inner.pop("ts", None)
-    # Assemble streamed encrypted chunks if the Pi used the stream path.
-    if inner.get("stream") is True and isinstance(inner.get("data_b64"), str):
-        return json.dumps({"ok": True, "id": rid, "stream": True,
-                           "data_b64": inner["data_b64"]})
-    return json.dumps({"ok": True, "id": rid, "result": inner})
+        r = L.fetch_result(PI_IDENT, rid)
+        if r.get("pending"):
+            time.sleep(5)
+            continue
+        if r.get("_http_error") or "enc" not in r:
+            return json.dumps({"ok": False, "stage": "result", "error": "bad envelope"})
+        try:
+            inner = secure_unpack(LINK_KEY, str(r["enc"]))
+        except Exception:
+            return json.dumps({"ok": False, "stage": "decrypt", "error": "wrong link key?"})
+        inner.pop("ts", None)
+        return json.dumps({"ok": True, "id": rid, "result": inner})
+    return json.dumps({"ok": False, "stage": "timeout", "id": rid})
 
 
 def _ensure_session() -> str | None:
-    """(Re)join the SSH session. Returns error text or None when joined."""
     try:
-        r = L.ssh_join(COMPUTER_ID or L.load_state().get("computer_id", ""), _ident(),
+        r = L.ssh_join(COMPUTER_ID, PI_IDENT,
                        secure_pack(LINK_KEY, {"hello": "mcp", "ts": int(time.time())}))
     except Exception as e:
         return f"join failed: {e}"
@@ -78,56 +62,44 @@ def _ensure_session() -> str | None:
     return None
 
 
-def _t_ssh_exec(a: dict) -> str:
+def _run_op(op: dict, wait_s: int) -> str:
     err = _ensure_session()
     if err:
         return json.dumps({"ok": False, "error": err})
-    rid = f"me{int(time.time() * 1000)}"
-    r = _send({"kind": "exec", "cmd": str(a.get("cmd", ""))[:4000]}, rid)
+    rid = f"mcp{int(time.time() * 1000)}"
+    r = _send(op, rid)
     if not r.get("ok"):
         return json.dumps({"ok": False, "stage": "request", "error": r.get("error")})
-    return _collect(rid, int(a.get("wait_s", 120) or 120))
+    return _collect(rid, wait_s)
+
+
+def _t_ssh_exec(a: dict) -> str:
+    return _run_op({"kind": "exec", "cmd": str(a.get("cmd", ""))[:4000]},
+                   int(a.get("wait_s", 120) or 120))
 
 
 def _t_ssh_read(a: dict) -> str:
-    err = _ensure_session()
-    if err:
-        return json.dumps({"ok": False, "error": err})
-    rid = f"mr{int(time.time() * 1000)}"
-    r = _send({"kind": "read", "path": str(a.get("path", ""))[:1024]}, rid)
-    if not r.get("ok"):
-        return json.dumps({"ok": False, "stage": "request", "error": r.get("error")})
-    return _collect(rid, int(a.get("wait_s", 120) or 120))
+    return _run_op({"kind": "read", "path": str(a.get("path", ""))[:1024]},
+                   int(a.get("wait_s", 120) or 120))
 
 
 def _t_ssh_write(a: dict) -> str:
-    err = _ensure_session()
-    if err:
-        return json.dumps({"ok": False, "error": err})
-    rid = f"mw{int(time.time() * 1000)}"
-    r = _send({"kind": "write", "path": str(a.get("path", ""))[:1024],
-               "data_b64": str(a.get("data_b64", ""))}, rid)
-    if not r.get("ok"):
-        return json.dumps({"ok": False, "stage": "request", "error": r.get("error")})
-    return _collect(rid, int(a.get("wait_s", 120) or 120))
+    return _run_op({"kind": "write", "path": str(a.get("path", ""))[:1024],
+                    "data_b64": str(a.get("data_b64", ""))},
+                   int(a.get("wait_s", 120) or 120))
 
 
 def _t_ssh_write_stream(a: dict) -> str:
-    """Stream a big file: one secure job carrying many encrypted chunks."""
-    import base64 as _b64
-
-    from pnasyscnct.common import secure_pack as _sp
-
     err = _ensure_session()
     if err:
         return json.dumps({"ok": False, "error": err})
     try:
-        raw = _b64.b64decode(str(a.get("data_b64", "")))
+        raw = base64.b64decode(str(a.get("data_b64", "")))
     except Exception:
         return json.dumps({"ok": False, "error": "bad data_b64"})
     n = 500_000
-    parts = [_sp(LINK_KEY, {"chunk": _b64.b64encode(raw[i:i + n]).decode()})
-             for i in range(0, len(raw), n)] or [_sp(LINK_KEY, {"chunk": ""})]
+    parts = [secure_pack(LINK_KEY, {"chunk": base64.b64encode(raw[i:i + n]).decode()})
+             for i in range(0, len(raw), n)] or [secure_pack(LINK_KEY, {"chunk": ""})]
     rid = f"ms{int(time.time() * 1000)}"
     r = _send({"kind": "write-parts", "path": str(a.get("path", ""))[:1024],
                "parts": parts}, rid)
@@ -143,7 +115,7 @@ def _t_ssh_reconnect(a: dict) -> str:
 
 def _t_ssh_status(a: dict) -> str:
     try:
-        st = L.ssh_status(_ident())
+        st = L.ssh_status(PI_IDENT)
     except Exception as e:
         return json.dumps({"ok": False, "error": f"{e}"})
     return json.dumps({"ok": True, "presence": st})
@@ -158,7 +130,6 @@ _HANDLERS = {
     "ssh_status": _t_ssh_status,
 }
 
-_STR = {"type": "string"}
 _WAIT = {"type": "integer", "description": "Seconds to wait", "default": 120}
 TOOLS = [
     {"name": "ssh_exec", "description": "Run a root shell command on the Pi.",
@@ -170,11 +141,11 @@ TOOLS = [
          "path": {"type": "string"}, "wait_s": _WAIT}, "required": ["path"]}},
     {"name": "ssh_write", "description": "Write a Pi file.",
      "inputSchema": {"type": "object", "properties": {
-         "path": _STR, "data_b64": {"type": "string"}, "wait_s": _WAIT},
+         "path": {"type": "string"}, "data_b64": {"type": "string"}, "wait_s": _WAIT},
          "required": ["path", "data_b64"]}},
     {"name": "ssh_write_stream", "description": "Stream a BIG file to the Pi in encrypted chunks.",
      "inputSchema": {"type": "object", "properties": {
-         "path": _STR, "data_b64": {"type": "string"},
+         "path": {"type": "string"}, "data_b64": {"type": "string"},
          "wait_s": {"type": "integer", "default": 300}}, "required": ["path", "data_b64"]}},
     {"name": "ssh_reconnect", "description": "Force SSH session rejoin.",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -251,11 +222,23 @@ def serve(link_key: str, pi_ident: str = "", computer_id: str = "") -> None:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="pnasyscnct MCP (stdio).")
     ap.add_argument("--enckey", default="", help="link encryption key")
+    ap.add_argument("--sshdev", default="", help="device name from pairing")
     ap.add_argument("--pi-ident", default="")
     ap.add_argument("--computer-id", default="")
     args = ap.parse_args(argv)
     if not args.enckey:
         print("--enckey (the link encryption key) is required.", file=sys.stderr)
+        raise SystemExit(2)
+    devs = L.pc_devices()
+    if args.sshdev:
+        if args.sshdev not in devs:
+            print(f"Unknown device '{args.sshdev}'.", file=sys.stderr)
+            raise SystemExit(2)
+        meta = devs[args.sshdev]
+        args.pi_ident = args.pi_ident or meta["pi_ident"]
+        args.computer_id = args.computer_id or meta["computer_id"]
+    if not args.pi_ident:
+        print("Need --sshdev (or --pi-ident).", file=sys.stderr)
         raise SystemExit(2)
     serve(link_key=args.enckey, pi_ident=args.pi_ident, computer_id=args.computer_id)
 
