@@ -42,8 +42,29 @@ def _save_state(s: dict) -> None:
     (SAFE / "state.json").write_text(json.dumps(cur, indent=2))
 
 
+def _offer_cleanup(created: set[str]) -> None:
+    others = sorted(p.name for base in (SAFE, VAULT) if base.exists() for p in base.iterdir()
+                    if p.is_file() and str(p) not in created)
+    if not others:
+        return
+    print(f"Old files present: {', '.join(others)}")
+    if input("Delete old files? [y/N]: ").strip().lower() in ("y", "yes"):
+        for base in (SAFE, VAULT):
+            for p in base.iterdir():
+                if p.is_file() and str(p) not in created:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+        print("Old files deleted.")
+
+
 def cmd_setup() -> int:
     _ensure()
+    if L.load_state().get("setup_done"):
+        if input("Already set up. Overwrite? [y/N]: ").strip().lower() not in ("y", "yes"):
+            print("Keeping existing setup.")
+            return 0
     print("pnasyscnct setup (computer)")
     fav_rest = input("Favorite restaurant: ").strip()
     fav_animal = input("Favorite animal: ").strip()
@@ -73,6 +94,7 @@ def cmd_setup() -> int:
             pass
     print(f"Computer ID: {computer_id}")
     print("Setup complete. Vault sealed with TPM (pnasys-ses).")
+    _offer_cleanup({str(CREDS), str(ACCESS), str(SAFE / "state.json")})
     return 0
 
 
@@ -119,6 +141,7 @@ def cmd_setup_ssh() -> int:
             continue
         req = r
     print("Pairing request received.")
+    dev_name = input("Device name for this Pi: ").strip() or "default"
     pair_key = getpass.getpass("Pairing encryption key (the one entered on the Pi): ")
     new_key = getpass.getpass("NEW link encryption key (choose now, Pi will adopt it): ")
     if not new_key:
@@ -136,8 +159,8 @@ def cmd_setup_ssh() -> int:
     if not r.get("ok"):
         print(f"Answer failed: {r}", file=sys.stderr)
         return 1
-    L.pc_save_link(computer_id, pi_ident, new_key, pw)
-    print("Linked. Pi verified and both sides hold the fresh link key.")
+    L.pc_save_link(computer_id, pi_ident, new_key, pw, name=dev_name)
+    print(f"Linked as '{dev_name}'. Pi verified and both sides hold the fresh link key.")
     return 0
 
 
@@ -232,14 +255,34 @@ def _stream_write(pi_ident: str, link_key: str, remote: str, raw: bytes) -> None
     print(f"streamed {len(raw)} bytes in {len(parts)} encrypted chunks (ok={ok})")
 
 
-def cmd_ssh() -> int:
-    pw, link = _unlock()
-    if "link_key" not in link:
-        print("Not linked yet. Run: pnasyscnct setup --ssh", file=sys.stderr)
+def cmd_ssh(name: str = "") -> int:
+    import hmac
+
+    pw, _me = _unlock()
+    devs = L.pc_devices()
+    if name:
+        if name not in devs:
+            print(f"Unknown device '{name}'. Linked: {', '.join(sorted(devs)) or 'none'}.",
+                  file=sys.stderr)
+            return 2
+    elif len(devs) == 1:
+        name = next(iter(devs))
+    else:
+        print(f"Choose a device: {', '.join(sorted(devs)) or 'none linked'}.", file=sys.stderr)
         return 2
+    try:
+        link = L.pc_load_link(pw, name)
+    except Exception:
+        print("Vault entry missing. Re-link with: pnasyscnct setup --ssh", file=sys.stderr)
+        return 2
+    typed = getpass.getpass("Link encryption key: ")
+    if not typed or not hmac.compare_digest(typed, link["link_key"]):
+        print("Wrong encryption key.", file=sys.stderr)
+        return 1
+    del typed
     L.ssh_join(link["computer_id"], link["pi_ident"],
                secure_pack(link["link_key"], {"hello": "pc", "ts": int(time.time())}))
-    print("Session open. Reconnects automatically on failure.")
+    print(f"Session open to '{name}'. Reconnects automatically on failure.")
     while True:
         rc = _shell(link["pi_ident"], link["link_key"])
         if rc == 0:
@@ -251,18 +294,58 @@ def cmd_ssh() -> int:
             return 130
 
 
-def cmd_mcp(enckey: str) -> int:
+def cmd_update() -> int:
+    import subprocess
+    import tempfile
+    import urllib.request
+
+    owner = os.environ.get("PNA_OWNER", "Powerentity303")
+    ref = os.environ.get("PNA_REF", "main")
+    url = (f"https://raw.githubusercontent.com/{owner}/PNASystems_CRP/"
+           f"{ref}/installer.sh?nocache={int(time.time())}")
+    print(f"Updating from {owner}/PNASystems_CRP@{ref} ...")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            script = r.read()
+    except Exception as e:
+        print(f"Download failed: {e}", file=sys.stderr)
+        return 1
+    with tempfile.NamedTemporaryFile("wb", suffix=".sh", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        return subprocess.run(["bash", path]).returncode
+    except FileNotFoundError:
+        print("bash not found (Windows: use the installer from GitHub instead).", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+def cmd_mcp(enckey: str, sshdev: str = "") -> int:
     from pnasyscnct.mcp_server import serve
 
-    st = L.load_state()
-    if not st.get("pi_ident") or not st.get("computer_id"):
-        print("Not linked yet. Run: pnasyscnct setup --ssh", file=sys.stderr)
+    devs = L.pc_devices()
+    if sshdev:
+        if sshdev not in devs:
+            print(f"Unknown device '{sshdev}'. Linked: {', '.join(sorted(devs)) or 'none'}.",
+                  file=sys.stderr)
+            return 2
+    elif len(devs) == 1:
+        sshdev = next(iter(devs))
+    else:
+        print("Pass --sshdev DEVICE. Linked: " f"{', '.join(sorted(devs)) or 'none'}.",
+              file=sys.stderr)
         return 2
     if not enckey:
         print("--enckey (the link encryption key) is required.", file=sys.stderr)
         return 2
-    print("MCP server starting (SSH session active).", file=sys.stderr)
-    serve(link_key=enckey, pi_ident=st["pi_ident"], computer_id=st["computer_id"])
+    meta = devs[sshdev]
+    print(f"MCP server starting for '{sshdev}' (SSH session active).", file=sys.stderr)
+    serve(link_key=enckey, pi_ident=meta["pi_ident"], computer_id=meta["computer_id"])
     return 0
 
 
@@ -283,20 +366,26 @@ def cmd_selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print("Usage: pnasyscnct {setup [--ssh]|ssh|mcp --enckey KEY|selftest}")
+        print("Usage: pnasyscnct {setup [--ssh]|ssh [DEVICE]|mcp --enckey KEY [--sshdev DEV]|selftest|update}")
         return 0
     if argv[0] == "setup" and "--ssh" in argv[1:]:
         return cmd_setup_ssh()
     if argv[0] == "setup":
         return cmd_setup()
     if argv[0] == "ssh":
-        return cmd_ssh()
+        rest = [a for a in argv[1:] if not a.startswith("-")]
+        return cmd_ssh(rest[0] if rest else "")
+    if argv[0] == "update":
+        return cmd_update()
     if argv[0] == "mcp":
-        key = ""
-        for i, a in enumerate(argv[1:]):
-            if a == "--enckey" and i + 1 < len(argv[1:]):
-                key = argv[1:][i + 1]
-        return cmd_mcp(key)
+        key, dev = "", ""
+        rest = argv[1:]
+        for i, a in enumerate(rest):
+            if a == "--enckey" and i + 1 < len(rest):
+                key = rest[i + 1]
+            if a == "--sshdev" and i + 1 < len(rest):
+                dev = rest[i + 1]
+        return cmd_mcp(key, dev)
     if argv[0] == "selftest":
         return cmd_selftest()
     print(f"Unknown command: {argv[0]}", file=sys.stderr)
