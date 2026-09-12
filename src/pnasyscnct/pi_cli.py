@@ -190,6 +190,11 @@ def cmd_update() -> int:
     import tempfile
     import urllib.request
 
+    # Pi updates touch system packages: prove root first via sudo's own prompt.
+    print("Root check (enter your sudo password):")
+    if subprocess.run(["sudo", "-v"]).returncode != 0:
+        print("sudo authentication failed.", file=sys.stderr)
+        return 1
     owner = os.environ.get("PNA_OWNER", "Powerentity303")
     ref = os.environ.get("PNA_REF", "main")
     url = (f"https://raw.githubusercontent.com/{owner}/PNASystems_CRP/"
@@ -220,12 +225,14 @@ def cmd_ssh_setup() -> int:
         return 2
     access, local_pw = _load_access()
     pi_ident = sha256_hex(access)
-    del access
     pair_key = getpass.getpass("Pairing encryption key (tell the computer this): ")
     if not pair_key:
         print("Pairing key required.", file=sys.stderr)
         return 2
     code = generate_session_key()
+    # CHECK-1: show the SAS now; the computer shows the same after decrypt.
+    # Both humans compare before the computer answers.
+    print(f"CHECK-1 SAS (computer must show the same): {L.sas(pair_key, code)}")
     blob = secure_pack(pair_key, {"pi_ident": pi_ident, "code": code,
                                   "ts": int(time.time())})
     computer_id = input("Computer ID (from `pnasyscnct setup`): ").strip()
@@ -260,12 +267,61 @@ def cmd_ssh_setup() -> int:
     try:
         inner = secure_unpack(check, ans["blob"])
         assert inner.get("computer_id") == computer_id and inner.get("ok")
+        # CHECK-2: answer must echo our code — proves computer decrypted us.
+        assert inner.get("code_echo") == L.code_echo(code), "code echo mismatch"
         link_key = inner["link_key"]
     except Exception:
-        print("Verify failed — wrong key?", file=sys.stderr)
+        print("Verify failed — wrong key or code echo mismatch (MITM?).", file=sys.stderr)
         return 1
     L.pi_save_link(computer_id, pi_ident, link_key, local_pw, name=dev_name)
+    # Fresh pairing owns the fingerprint pin: reset it under access-key auth.
+    try:
+        L.reset_pin(pi_ident, what="all", access_key=access)
+    except Exception as e:
+        print(f"pin reset note: {e}")
+    del access
     print(f"Linked as '{dev_name}' and verified. Run: pnasyscrp ssh enable")
+    return 0
+
+
+def cmd_delete() -> int:
+    """Wipe this Pi: local files + GitHub queue/presence purged + tombstoned.
+
+    After this, computers trying to connect fail with the reason and are
+    offered local removal. Requires re-setup + re-pair to use again.
+    """
+    if not L.load_state().get("setup_done"):
+        print("Nothing set up.", file=sys.stderr)
+        return 2
+    access, _pw = _load_access()
+    pi_ident = sha256_hex(access)
+    if input("Delete THIS PI (local files + GitHub data + tombstone)? "
+             "Type YES: ").strip() != "YES":
+        print("Aborted.")
+        return 2
+    try:
+        r = L.purge(pi_ident, access_key=access)
+        print(f"GitHub purge: {'ok' if r.get('ok') else r}")
+    except Exception as e:
+        print(f"Purge failed: {e}", file=sys.stderr)
+    try:
+        L.reset_pin(pi_ident, what="pin", access_key=access)
+    except Exception:
+        pass
+    try:
+        r = L.mark_deleted(pi_ident, access_key=access)
+        print(f"Tombstone: {'written' if r.get('ok') else r}")
+    except Exception as e:
+        print(f"Tombstone failed: {e}", file=sys.stderr)
+    del access
+    for f in (ACCESS, PI_BLOB, CREDS, SESSION, VAULT / "link.enc.json",
+              VAULT / "listener.env"):
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+    L.save_state({"setup_done": False, "devices": {}})
+    print("Pi deleted. Re-run setup + pairing to use again.")
     return 0
 
 
@@ -289,7 +345,7 @@ def cmd_ssh_enable() -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print("Usage: pnasyscrp {setup|enable|disable|revokeapi|selftest|update|ssh setup|ssh enable}")
+        print("Usage: pnasyscrp {setup|enable|disable|revokeapi|selftest|update|delete|ssh setup|ssh enable}")
         return 0
     if argv[0] == "ssh" and len(argv) > 1 and argv[1] == "setup":
         return cmd_ssh_setup()
@@ -297,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ssh_enable()
     return {"setup": cmd_setup, "enable": cmd_enable, "disable": cmd_disable,
             "revokeapi": cmd_revokeapi, "selftest": cmd_selftest,
-            "update": cmd_update}.get(argv[0], lambda: (print(f"Unknown: {argv[0]}",
+            "update": cmd_update, "delete": cmd_delete}.get(argv[0], lambda: (print(f"Unknown: {argv[0]}",
                                                               file=sys.stderr), 2)[1])()
 
 
