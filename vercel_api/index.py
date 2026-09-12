@@ -104,7 +104,7 @@ def make_request():
         kind = str(data.get("kind", ""))
         if kind not in KINDS:
             return jsonify({"error": "bad kind"}), 400
-        ident = _check_registered(cfg, access_key)
+        ident = _check_ident_or_key(cfg, access_key)
         rid = str(data.get("id") or f"r{int(time.time() * 1000)}")
         if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", rid):
             return jsonify({"error": "bad id"}), 400
@@ -292,6 +292,176 @@ def revoke():
         except Exception:
             pass
         return jsonify({"ok": True, "deleted_key": ok})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+def _check_ident_or_key(cfg: dict, access_key: str) -> str:
+    """kind=secure accepts a registered access key OR 'ident:<hex>' of one."""
+    if access_key.startswith("ident:"):
+        ident = access_key[6:]
+        if not re.fullmatch(r"[0-9a-f]{64}", ident):
+            raise LookupError("bad ident")
+        _check_registered_by_ident(cfg, ident)
+        return ident
+    return _check_registered(cfg, access_key)
+
+
+@app.post("/api/link/request")
+def link_request():
+    """Pi drops an opaque pairing blob for a computer id."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        cid = str(data.get("computer_id", ""))
+        blob = str(data.get("blob", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", cid) or not blob:
+            return jsonify({"error": "bad computer_id/blob"}), 400
+        gs.put_file(cfg["queue"], f"link_req/{cid}.json",
+                    json.dumps({"blob": blob, "ts": int(time.time())}).encode(),
+                    "pairing request", cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.get("/api/link/poll")
+def link_poll():
+    """Computer long-polls for its pairing request (claimed)."""
+    try:
+        cfg = _cfg()
+        cid = str(request.args.get("computer_id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", cid):
+            return jsonify({"error": "bad computer_id"}), 400
+        for _ in range(12):
+            raw = gs.get_file(cfg["queue"], f"link_req/{cid}.json", cfg["token"], cfg["qb"])
+            if raw is not None:
+                gs.delete_file(cfg["queue"], f"link_req/{cid}.json",
+                               "pairing claimed", cfg["token"], cfg["qb"])
+                return jsonify(json.loads(raw.decode()))
+            time.sleep(4)
+        return jsonify({"empty": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/link/answer")
+def link_answer():
+    """Computer drops the opaque answer for the Pi."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        cid = str(data.get("computer_id", ""))
+        blob = str(data.get("blob", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", cid) or not blob:
+            return jsonify({"error": "bad computer_id/blob"}), 400
+        # Filename carries no Pi identity until decrypted device-side; the Pi
+        # polls its own slot below. Store per-computer; Pi claims by exact key.
+        pi_hint = str(data.get("for_pi", ""))
+        name = f"link_ans/{cid}-{pi_hint}.json" if re.fullmatch(r"[0-9a-f]{64}", pi_hint) \
+            else f"link_ans/{cid}.json"
+        gs.put_file(cfg["queue"], name,
+                    json.dumps({"blob": blob, "ts": int(time.time())}).encode(),
+                    "pairing answer", cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.get("/api/link/wait")
+def link_wait():
+    """Pi long-waits for the computer's answer, then claims it."""
+    try:
+        cfg = _cfg()
+        cid = str(request.args.get("computer_id", ""))
+        pi = str(request.args.get("pi_ident", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", cid) or not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad ids"}), 400
+        for name in (f"link_ans/{cid}-{pi}.json", f"link_ans/{cid}.json"):
+            for _ in range(6):
+                raw = gs.get_file(cfg["queue"], name, cfg["token"], cfg["qb"])
+                if raw is not None:
+                    gs.delete_file(cfg["queue"], name, "answer claimed",
+                                   cfg["token"], cfg["qb"])
+                    return jsonify(json.loads(raw.decode()))
+                time.sleep(4)
+        return jsonify({"empty": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/ssh/hello")
+def ssh_hello():
+    """Pi heartbeat (opaque). Overwrites each time."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        pi = str(data.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        gs.put_file(cfg["queue"], f"ssh/{pi}.json",
+                    json.dumps({"blob": str(data.get("blob", "")),
+                                "ts": int(time.time())}).encode(),
+                    "presence", cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.get("/api/ssh/status")
+def ssh_status():
+    try:
+        cfg = _cfg()
+        pi = str(request.args.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        raw = gs.get_file(cfg["queue"], f"ssh/{pi}.json", cfg["token"], cfg["qb"])
+        if raw is None:
+            return jsonify({"live": False})
+        try:
+            ts = json.loads(raw.decode()).get("ts", 0)
+        except Exception:
+            ts = 0
+        return jsonify({"live": int(time.time()) - int(ts) < 120})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/ssh/join")
+def ssh_join():
+    """Computer opens a session (opaque hello for the Pi to notice)."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        pi = str(data.get("pi_ident", ""))
+        cid = str(data.get("computer_id", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi) or not cid:
+            return jsonify({"error": "bad ids"}), 400
+        gs.put_file(cfg["queue"], f"ssh/{pi}-join.json",
+                    json.dumps({"blob": str(data.get("blob", "")),
+                                "ts": int(time.time())}).encode(),
+                    "session join", cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.get("/api/ssh/wait")
+def ssh_wait():
+    """Pi long-waits for a computer join, then claims it."""
+    try:
+        cfg = _cfg()
+        pi = str(request.args.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        for _ in range(12):
+            raw = gs.get_file(cfg["queue"], f"ssh/{pi}-join.json", cfg["token"], cfg["qb"])
+            if raw is not None:
+                gs.delete_file(cfg["queue"], f"ssh/{pi}-join.json",
+                               "join claimed", cfg["token"], cfg["qb"])
+                return jsonify(json.loads(raw.decode()))
+            time.sleep(4)
+        return jsonify({"empty": True})
     except Exception as e:
         return jsonify({"error": _redact(e)[:200]}), 500
 
