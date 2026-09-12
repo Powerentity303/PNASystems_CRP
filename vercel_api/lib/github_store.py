@@ -86,92 +86,121 @@ def _get_sha(owner_repo: str, path: str, token: str, branch: str) -> str | None:
 
 def _put_text(owner_repo: str, path: str, text: str, message: str,
               token: str, branch: str) -> None:
-    sha = _get_sha(owner_repo, path, token, branch)
+    """PUT directly (no pre-GET): new unique paths skip a round trip.
+
+    On 422 (path exists) fetch the sha and retry once with it.
+    """
     content = base64.b64encode(text.encode("utf-8")).decode("ascii")
-    body: dict = {"message": message, "content": content, "branch": branch}
-    if sha:
-        body["sha"] = sha
     st, resp = _call(f"{API}/repos/{owner_repo}/contents/{path}", token,
-                     method="PUT", body=body)
-    if st not in (200, 201):
-        raise RuntimeError(f"PUT {path}: HTTP {st} :: {_redact(resp)[:300]}")
+                     method="PUT", body={"message": message, "content": content,
+                                         "branch": branch})
+    if st in (200, 201):
+        return
+    if st == 422:
+        sha = _get_sha(owner_repo, path, token, branch)
+        if sha:
+            st2, resp2 = _call(f"{API}/repos/{owner_repo}/contents/{path}", token,
+                               method="PUT", body={"message": message, "content": content,
+                                                   "branch": branch, "sha": sha})
+            if st2 in (200, 201):
+                return
+            raise RuntimeError(f"PUT {path}: HTTP {st2} :: {_redact(resp2)[:300]}")
+    raise RuntimeError(f"PUT {path}: HTTP {st} :: {_redact(resp)[:300]}")
 
 
 def put_file(owner_repo: str, path: str, raw: bytes, message: str, token: str,
              branch: str = "main", chunk_size: int = BASE_CHUNK) -> None:
-    """Store raw bytes (base64-chunked when large) with 15 shrinking retries."""
+    """Store raw bytes (base64-chunked when large) with 15 shrinking retries.
+
+    On total failure, best-effort removes already-written parts so a later
+    retry never reads a half-written file.
+    """
     b64 = base64.b64encode(raw).decode("ascii")
     size = chunk_size
     last: Exception | None = None
+    written: list[str] = []
     for attempt in range(MAX_RETRIES):
         try:
             parts = [b64[i:i + size] for i in range(0, len(b64), size)] or [""]
             if len(parts) == 1:
                 _put_text(owner_repo, path, parts[0], message, token, branch)
-            else:
-                meta = json.dumps({"parts": len(parts), "encoding": "base64"})
-                _put_text(owner_repo, path + ".meta.json", meta, message, token, branch)
-                for i, p in enumerate(parts):
-                    _put_text(owner_repo, f"{path}.part{i:03d}", p, message, token, branch)
+                return
+            meta = json.dumps({"parts": len(parts), "encoding": "base64"})
+            _put_text(owner_repo, path + ".meta.json", meta, message, token, branch)
+            written.append(path + ".meta.json")
+            for i, p in enumerate(parts):
+                _put_text(owner_repo, f"{path}.part{i:03d}", p, message, token, branch)
+                written.append(f"{path}.part{i:03d}")
             return
         except Exception as e:
             last = e
             size = max(100_000, size * 3 // 4)
             time.sleep(min(30.0, 1.5 * (attempt + 1)))
+    for p in written:
+        try:
+            _delete_one(owner_repo, p, "cleanup partial", token, branch)
+        except Exception:
+            pass
     raise RuntimeError(f"github put failed after {MAX_RETRIES}: {_redact(last)[:300]}")
 
 
 def get_file(owner_repo: str, path: str, token: str, branch: str = "main") -> bytes | None:
-    """Fetch a (possibly chunked) file. Returns None when absent."""
-    st, body = _call(f"{API}/repos/{owner_repo}/contents/{path}.meta.json?ref={branch}", token)
+    """Fetch a (possibly chunked) file. Returns None when absent.
+
+    Direct path first (1 call for the common small-file case); chunked
+    metafile fallback only on a miss.
+    """
+    st, body = _call(f"{API}/repos/{owner_repo}/contents/{path}?ref={branch}", token)
     if st == 200:
         try:
-            meta = json.loads(base64.b64decode(json.loads(body)["content"]).decode())
-            n = int(meta.get("parts", 0))
+            payload = json.loads(body)
+            if isinstance(payload, list):
+                return None
+            # File text is itself base64(raw) (single-part store); decode twice.
+            file_text = base64.b64decode(payload["content"]).decode("ascii")
+            return base64.b64decode(file_text)
         except Exception:
             return None
-        chunks: list[str] = []
-        for i in range(n):
-            pst, pbody = _call(
-                f"{API}/repos/{owner_repo}/contents/{path}.part{i:03d}?ref={branch}", token)
-            if pst != 200:
-                return None
-            try:
-                chunks.append(base64.b64decode(json.loads(pbody)["content"]).decode("ascii"))
-            except Exception:
-                return None
-        try:
-            return base64.b64decode("".join(chunks))
-        except Exception:
-            return None
-    st, body = _call(f"{API}/repos/{owner_repo}/contents/{path}?ref={branch}", token)
+    if st != 404:
+        return None
+    st, body = _call(f"{API}/repos/{owner_repo}/contents/{path}.meta.json?ref={branch}", token)
     if st != 200:
         return None
     try:
-        payload = json.loads(body)
-        if isinstance(payload, list):
-            return None
-        # File text is itself base64(raw) (single-part store); decode twice.
-        file_text = base64.b64decode(payload["content"]).decode("ascii")
-        return base64.b64decode(file_text)
+        meta = json.loads(base64.b64decode(json.loads(body)["content"]).decode())
+        n = int(meta.get("parts", 0))
     except Exception:
         return None
+    chunks: list[str] = []
+    for i in range(n):
+        pst, pbody = _call(
+            f"{API}/repos/{owner_repo}/contents/{path}.part{i:03d}?ref={branch}", token)
+        if pst != 200:
+            return None
+        try:
+            chunks.append(base64.b64decode(json.loads(pbody)["content"]).decode("ascii"))
+        except Exception:
+            return None
+    try:
+        return base64.b64decode("".join(chunks))
+    except Exception:
+        return None
+
+
+def _delete_one(owner_repo: str, path: str, message: str, token: str, branch: str) -> bool:
+    sha = _get_sha(owner_repo, path, token, branch)
+    if not sha:
+        return False
+    st, resp = _call(f"{API}/repos/{owner_repo}/contents/{path}", token, method="DELETE",
+                     body={"message": message, "sha": sha, "branch": branch})
+    if st == 200:
+        return True
+    raise RuntimeError(f"DELETE {path}: HTTP {st} :: {_redact(resp)[:200]}")
 
 
 def delete_file(owner_repo: str, path: str, message: str, token: str,
                 branch: str = "main") -> bool:
     """Delete file (and any chunk parts). True if something was deleted."""
-
-    def _delete_one(p: str) -> bool:
-        sha = _get_sha(owner_repo, p, token, branch)
-        if not sha:
-            return False
-        st, resp = _call(f"{API}/repos/{owner_repo}/contents/{p}", token, method="DELETE",
-                         body={"message": message, "sha": sha, "branch": branch})
-        if st == 200:
-            return True
-        raise RuntimeError(f"DELETE {p}: HTTP {st} :: {_redact(resp)[:200]}")
-
     deleted = False
     # Chunked?
     st, body = _call(f"{API}/repos/{owner_repo}/contents/{path}.meta.json?ref={branch}", token)
@@ -182,10 +211,10 @@ def delete_file(owner_repo: str, path: str, message: str, token: str,
         except Exception:
             n = 0
         for i in range(n):
-            _delete_one(f"{path}.part{i:03d}")
-        _delete_one(path + ".meta.json")
+            _delete_one(owner_repo, f"{path}.part{i:03d}", message, token, branch)
+        _delete_one(owner_repo, path + ".meta.json", message, token, branch)
         deleted = True
-    return _delete_one(path) or deleted
+    return _delete_one(owner_repo, path, message, token, branch) or deleted
 
 
 def list_dir(owner_repo: str, path: str, token: str, branch: str = "main") -> list[dict]:
