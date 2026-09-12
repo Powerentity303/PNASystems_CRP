@@ -1,0 +1,171 @@
+"""Pairing + link transport over the Vercel API (all payloads opaque).
+
+Computer vault: pnasys-ses (TPM on Win11) slot "cnct_link", EncryptionKey =
+local password. Plaintext state.json holds non-secret ids.
+Pi vault: AES-GCM files under ~/.pnasys_crp/.vault (no TPM on Pi).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+SAFE = HOME / ".pnasys_crp"
+VAULT = SAFE / ".vault"
+STATE = SAFE / "state.json"
+LINK_AES = VAULT / "link.enc.json"  # Pi side: AES(local pw) {computer_id, pi_ident, link_key}
+
+
+def base() -> str:
+    try:
+        return json.loads(STATE.read_text()).get("vercel_base", "") or \
+            os.environ.get("PNASYS_VERCEL_BASE", "https://pnasys-crp-api.vercel.app")
+    except Exception:
+        return os.environ.get("PNASYS_VERCEL_BASE", "https://pnasys-crp-api.vercel.app")
+
+
+def api(method: str, path: str, body: dict | None = None, timeout: int = 65) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base().rstrip("/") + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"_text": raw[:500]}
+    except urllib.error.HTTPError as e:
+        try:
+            return {"_http_error": e.code, **json.loads(e.read().decode()[:300])}
+        except Exception:
+            return {"_http_error": e.code}
+
+
+def ident_of(access_key: str) -> str:
+    return hashlib.sha256(access_key.encode()).hexdigest()
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(patch: dict) -> None:
+    SAFE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    s = load_state()
+    s.update(patch)
+    STATE.write_text(json.dumps(s, indent=2))
+    try:
+        os.chmod(STATE, 0o600)
+    except Exception:
+        pass
+
+
+# --- computer vault (pnasys-ses, TPM) ---
+
+def pc_save_link(computer_id: str, pi_ident: str, link_key: str, local_pw: str) -> None:
+    from pnasys_ses import SecureEncryptionService as SES
+
+    SES.CreateEncryptedFile(json.dumps({"computer_id": computer_id, "pi_ident": pi_ident,
+                                        "link_key": link_key}), "cnct_link", local_pw)
+    save_state({"computer_id": computer_id, "pi_ident": pi_ident})
+
+
+def pc_load_link(local_pw: str) -> dict:
+    from pnasys_ses import SecureEncryptionService as SES
+
+    return json.loads(SES.DecryptEncryptedFile("cnct_link", local_pw))
+
+
+# --- pi vault (AES-GCM, local pw) ---
+
+def pi_save_link(computer_id: str, pi_ident: str, link_key: str, local_pw: str) -> None:
+    from pnasyscnct.common import encrypt_local
+
+    VAULT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    LINK_AES.write_text(json.dumps(encrypt_local(
+        json.dumps({"computer_id": computer_id, "pi_ident": pi_ident,
+                    "link_key": link_key}).encode(), local_pw)))
+    try:
+        os.chmod(LINK_AES, 0o600)
+    except Exception:
+        pass
+    save_state({"computer_id": computer_id, "pi_ident": pi_ident})
+
+
+def pi_load_link(local_pw: str) -> dict:
+    from pnasyscnct.common import decrypt_local
+
+    return json.loads(decrypt_local(json.loads(LINK_AES.read_text()), local_pw).decode())
+
+
+# --- pairing / presence calls (opaque blobs; Vercel never decrypts) ---
+
+def link_request(computer_id: str, blob: str) -> dict:
+    return api("POST", "/api/link/request", {"computer_id": computer_id, "blob": blob})
+
+
+def link_poll(computer_id: str) -> dict:
+    return api("GET", f"/api/link/poll?computer_id={computer_id}", timeout=65)
+
+
+def link_answer(computer_id: str, blob: str, for_pi: str = "") -> dict:
+    body = {"computer_id": computer_id, "blob": blob}
+    if for_pi:
+        body["for_pi"] = for_pi
+    return api("POST", "/api/link/answer", body)
+
+
+def link_wait(computer_id: str, pi_ident: str) -> dict:
+    return api("GET", f"/api/link/wait?computer_id={computer_id}&pi_ident={pi_ident}", timeout=65)
+
+
+def ssh_hello(pi_ident: str, blob: str) -> dict:
+    return api("POST", "/api/ssh/hello", {"pi_ident": pi_ident, "blob": blob})
+
+
+def ssh_status(pi_ident: str) -> dict:
+    return api("GET", f"/api/ssh/status?pi_ident={pi_ident}", timeout=25)
+
+
+def ssh_join(computer_id: str, pi_ident: str, blob: str) -> dict:
+    return api("POST", "/api/ssh/join", {"computer_id": computer_id,
+                                         "pi_ident": pi_ident, "blob": blob})
+
+
+def ssh_wait_join(pi_ident: str) -> dict:
+    return api("GET", f"/api/ssh/wait?pi_ident={pi_ident}", timeout=65)
+
+
+def enqueue(access_key: str, kind: str, fields: dict, rid: str | None = None) -> dict:
+    body = {"access_key": access_key, "kind": kind}
+    body.update(fields)
+    if rid:
+        body["id"] = rid
+    return api("POST", "/api/request", body)
+
+
+def fetch_result(ident: str, rid: str) -> dict:
+    return api("GET", f"/api/result?ident={ident}&id={rid}", timeout=65)
+
+
+def wait_result(ident: str, rid: str, wait_s: int = 120) -> dict:
+    deadline = time.time() + max(5, min(wait_s, 300))
+    while time.time() < deadline:
+        r = fetch_result(ident, rid)
+        if not r.get("pending"):
+            return r
+        time.sleep(5)
+    return {"pending": True, "timeout": True}
+
+
+def check_health() -> dict:
+    return api("GET", "/api/health", timeout=20)
