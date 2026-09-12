@@ -9,6 +9,8 @@ MODE="${MODE:-github}"
 VENV="$HOME/.pnasys_crp/.venv"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+echo "[pnasyscnct] root check — enter your sudo password:"
+sudo -v || { echo "[pnasyscnct] sudo authentication failed." >&2; exit 1; }
 if ! command -v git >/dev/null 2>&1; then
   sudo apt-get update && sudo apt-get install -y git
 fi
