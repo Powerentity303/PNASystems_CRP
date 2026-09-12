@@ -15,6 +15,11 @@ This gives you **both** commands: `pnasyscnct` (computer) and `pnasyscrp` (Pi).
 
 ## Computer
 
+The computer side runs on Windows 11 (TPM 2.0) **and Linux** (any distro
+with Python 3.10+; installer uses `apt` on Debian/Ubuntu, otherwise
+pre-install `git python3-venv`). Off-Windows the vault falls back to
+AES-GCM (same API); only the key sealing differs.
+
 ```bash
 pnasyscnct setup            # same questions + TPM-sealed vault, prints computer ID
 pnasyscnct setup --ssh      # scan for the Pi's pairing request, verify, rotate link key
