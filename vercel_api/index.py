@@ -429,14 +429,36 @@ def ssh_status():
 
 @app.post("/api/ssh/join")
 def ssh_join():
-    """Computer opens a session (opaque hello for the Pi to notice)."""
+    """Computer opens a session. Fingerprint pinned per Pi (anti-MITM).
+
+    First join for a Pi pins fp; later joins with a different fp get 403.
+    Re-pairing resets the pin via /api/link/reset (access-key authenticated).
+    """
     try:
         cfg = _cfg()
         data = request.get_json(force=True)
         pi = str(data.get("pi_ident", ""))
         cid = str(data.get("computer_id", ""))
+        fp = str(data.get("fp", ""))
         if not re.fullmatch(r"[0-9a-f]{64}", pi) or not cid:
             return jsonify({"error": "bad ids"}), 400
+        if fp:
+            if not re.fullmatch(r"[0-9a-f]{64}", fp):
+                return jsonify({"error": "bad fp"}), 400
+            pin_raw = gs.get_file(cfg["queue"], f"link_fp/{pi}.json", cfg["token"], cfg["qb"])
+            if pin_raw is not None:
+                try:
+                    pinned = json.loads(pin_raw.decode()).get("fp", "")
+                except Exception:
+                    pinned = ""
+                if pinned and pinned != fp:
+                    return jsonify({"error": "fingerprint mismatch",
+                                    "hint": "Pi re-keyed elsewhere or MITM replay. "
+                                            "Re-pair if you rotated keys."}), 403
+            else:
+                gs.put_file(cfg["queue"], f"link_fp/{pi}.json",
+                            json.dumps({"fp": fp, "ts": int(time.time())}).encode(),
+                            "pin fingerprint", cfg["token"], cfg["qb"])
         gs.put_file(cfg["queue"], f"ssh/{pi}-join.json",
                     json.dumps({"blob": str(data.get("blob", "")),
                                 "ts": int(time.time())}).encode(),
@@ -462,6 +484,153 @@ def ssh_wait():
                 return jsonify(json.loads(raw.decode()))
             time.sleep(4)
         return jsonify({"empty": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/ssh/ack")
+def ssh_ack():
+    """Pi posts its session ack (unforgeable without the link key)."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        pi = str(data.get("pi_ident", ""))
+        ack = str(data.get("ack", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi) or not re.fullmatch(r"[0-9a-f]{64}", ack):
+            return jsonify({"error": "bad pi_ident/ack"}), 400
+        gs.put_file(cfg["queue"], f"ssh/{pi}-ack.json",
+                    json.dumps({"ack": ack, "ts": int(time.time())}).encode(),
+                    "session ack", cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.get("/api/ssh/ack")
+def ssh_ack_get():
+    try:
+        cfg = _cfg()
+        pi = str(request.args.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        raw = gs.get_file(cfg["queue"], f"ssh/{pi}-ack.json", cfg["token"], cfg["qb"])
+        if raw is None:
+            return jsonify({"pending": True})
+        gs.delete_file(cfg["queue"], f"ssh/{pi}-ack.json", "ack collected",
+                       cfg["token"], cfg["qb"])
+        return jsonify(json.loads(raw.decode()))
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+def _auth_pi(cfg: dict, pi: str, access_key: str, fp: str) -> bool:
+    """True if access_key owns this ident OR fp matches the pinned fp."""
+    if access_key:
+        try:
+            _check_registered(cfg, access_key)
+            return ident_for(access_key) == pi
+        except LookupError:
+            return False
+    if fp and re.fullmatch(r"[0-9a-f]{64}", fp):
+        raw = gs.get_file(cfg["queue"], f"link_fp/{pi}.json", cfg["token"], cfg["kb"])
+        try:
+            return bool(raw) and json.loads(raw.decode()).get("fp", "") == fp
+        except Exception:
+            return False
+    return False
+
+
+@app.get("/api/check-deleted")
+def check_deleted():
+    try:
+        cfg = _cfg()
+        pi = str(request.args.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        raw = gs.get_file(cfg["queue"], f"deleted/{pi}.json", cfg["token"], cfg["qb"])
+        if raw is None:
+            return jsonify({"deleted": False})
+        try:
+            ts = json.loads(raw.decode()).get("ts", 0)
+        except Exception:
+            ts = 0
+        return jsonify({"deleted": True, "ts": ts})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/mark-deleted")
+def mark_deleted():
+    """Pi tombstones itself (fp- or access-key authenticated)."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        pi = str(data.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        if not _auth_pi(cfg, pi, str(data.get("access_key", "")), str(data.get("fp", ""))):
+            return jsonify({"error": "not authorized"}), 403
+        gs.put_file(cfg["queue"], f"deleted/{pi}.json",
+                    json.dumps({"ts": int(time.time()), "by": "pi"}).encode(),
+                    "tombstone", cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/purge")
+def purge():
+    """Delete a Pi's queue/resp/stream/presence/link files (keeps keys, pin, tombstone)."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        pi = str(data.get("pi_ident", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi):
+            return jsonify({"error": "bad pi_ident"}), 400
+        if not _auth_pi(cfg, pi, str(data.get("access_key", "")), str(data.get("fp", ""))):
+            return jsonify({"error": "not authorized"}), 403
+        n = 0
+        for directory, prefix, suffix in (
+                ("queue", pi + "-", ".json"), ("resp", pi + "-", ".json"),
+                ("stream", pi + "-", ""), ("ssh", pi, ""), ("link_ans", "", "-" + pi + ".json")):
+            try:
+                entries = gs.list_dir(cfg["queue"], directory, cfg["token"], cfg["qb"])
+            except Exception:
+                continue
+            for e in entries:
+                if e.get("type") != "file":
+                    continue
+                name = e["name"]
+                if name.startswith(prefix) and name.endswith(suffix):
+                    try:
+                        if gs.delete_file(cfg["queue"], f"{directory}/{name}",
+                                          "purge", cfg["token"], cfg["qb"]):
+                            n += 1
+                    except Exception:
+                        pass
+        return jsonify({"ok": True, "deleted": n})
+    except Exception as e:
+        return jsonify({"error": _redact(e)[:200]}), 500
+
+
+@app.post("/api/link/reset")
+def link_reset():
+    """Clear pin and/or tombstone. what=pin keeps tombstone; what=all clears both."""
+    try:
+        cfg = _cfg()
+        data = request.get_json(force=True)
+        pi = str(data.get("pi_ident", ""))
+        what = str(data.get("what", "all"))
+        if not re.fullmatch(r"[0-9a-f]{64}", pi) or what not in ("pin", "all"):
+            return jsonify({"error": "bad pi_ident/what"}), 400
+        if not _auth_pi(cfg, pi, str(data.get("access_key", "")), str(data.get("fp", ""))):
+            return jsonify({"error": "not authorized"}), 403
+        gs.delete_file(cfg["queue"], f"link_fp/{pi}.json", "pin reset",
+                       cfg["token"], cfg["qb"])
+        if what == "all":
+            gs.delete_file(cfg["queue"], f"deleted/{pi}.json", "tombstone cleared",
+                           cfg["token"], cfg["qb"])
+        return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": _redact(e)[:200]}), 500
 
