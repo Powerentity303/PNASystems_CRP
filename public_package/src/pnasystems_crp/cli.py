@@ -5,6 +5,7 @@ import getpass
 import json
 import os
 import sys
+import time
 import urllib.request
 import uuid
 from pathlib import Path
@@ -131,7 +132,9 @@ def cmd_setup(vercel_base: str) -> int:
     _save_state({"setup_done": True, "vercel_base": vercel_base,
                  "uuid2_ref": sha256_hex(uuid2)[:16]})
     print("Setup complete. Register response: " + body)
-    print(f"Vault: {VAULT} (creds.txt 600, pi_blob saved, access key encrypted locally)")
+    print(f"Vault: {VAULT} (creds + access key AES-encrypted locally)")
+    print("Access key (save this — the AI needs it with each session key):")
+    print(access_key)
     return 0
 
 
@@ -173,6 +176,35 @@ def cmd_disable() -> int:
 
     _require_setup()
     return stop_daemon()
+
+
+def cmd_update() -> int:
+    """Re-fetch the installer (cache-busted) and reinstall latest."""
+    import subprocess
+    import tempfile
+
+    owner = os.environ.get("PNA_OWNER", "Powerentity303")
+    ref = os.environ.get("PNA_REF", "main")
+    url = (f"https://raw.githubusercontent.com/{owner}/PNASystems_CRP/"
+           f"{ref}/installer.sh?nocache={int(time.time())}")
+    print(f"Updating from {owner}/PNASystems_CRP@{ref} ...")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            script = r.read()
+    except Exception as e:
+        print(f"Download failed: {e}", file=sys.stderr)
+        return 1
+    with tempfile.NamedTemporaryFile("wb", suffix=".sh", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        r = subprocess.run(["bash", path])
+        return r.returncode
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 def cmd_revokeapi(vercel_base: str) -> int:
@@ -247,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     vercel_base = os.environ.get("PNASYS_VERCEL_BASE", "https://pnasys-crp-api.vercel.app")
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print("Usage: pnasyscrp {setup|enable|disable|revokeapi|selftest}")
+        print("Usage: pnasyscrp {setup|enable|disable|revokeapi|selftest|update}")
         return 0
     cmd = argv[0].lower()
     if cmd == "setup":
@@ -258,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_disable()
     if cmd == "revokeapi":
         return cmd_revokeapi(vercel_base)
+    if cmd == "update":
+        return cmd_update()
     if cmd == "selftest":
         return cmd_selftest()
     print(f"Unknown command: {cmd}", file=sys.stderr)
