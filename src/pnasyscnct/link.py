@@ -69,36 +69,56 @@ def save_state(patch: dict) -> None:
         pass
 
 
-# --- computer vault (pnasys-ses, TPM) ---
+# --- computer vault (pnasys-ses, TPM). One slot per device name. ---
 
-def pc_save_link(computer_id: str, pi_ident: str, link_key: str, local_pw: str) -> None:
+def _link_slot(name: str) -> str:
+    name = (name or "default").strip() or "default"
+    return f"cnct_link:{name}"
+
+
+def pc_save_link(computer_id: str, pi_ident: str, link_key: str, local_pw: str,
+                 name: str = "default") -> None:
     from pnasys_ses import SecureEncryptionService as SES
 
+    name = (name or "default").strip() or "default"
     SES.CreateEncryptedFile(json.dumps({"computer_id": computer_id, "pi_ident": pi_ident,
-                                        "link_key": link_key}), "cnct_link", local_pw)
-    save_state({"computer_id": computer_id, "pi_ident": pi_ident})
+                                        "link_key": link_key}), _link_slot(name), local_pw)
+    st = load_state()
+    devs = st.get("devices", {})
+    devs[name] = {"computer_id": computer_id, "pi_ident": pi_ident}
+    st["devices"] = devs
+    save_state(st)
 
 
-def pc_load_link(local_pw: str) -> dict:
+def pc_load_link(local_pw: str, name: str = "default") -> dict:
     from pnasys_ses import SecureEncryptionService as SES
 
-    return json.loads(SES.DecryptEncryptedFile("cnct_link", local_pw))
+    return json.loads(SES.DecryptEncryptedFile(_link_slot(name), local_pw))
+
+
+def pc_devices() -> dict:
+    return load_state().get("devices", {})
 
 
 # --- pi vault (AES-GCM, local pw) ---
 
-def pi_save_link(computer_id: str, pi_ident: str, link_key: str, local_pw: str) -> None:
+def pi_save_link(computer_id: str, pi_ident: str, link_key: str, local_pw: str,
+                 name: str = "default") -> None:
     from pnasyscnct.common import encrypt_local
 
     VAULT.mkdir(mode=0o700, parents=True, exist_ok=True)
     LINK_AES.write_text(json.dumps(encrypt_local(
         json.dumps({"computer_id": computer_id, "pi_ident": pi_ident,
-                    "link_key": link_key}).encode(), local_pw)))
+                    "link_key": link_key, "name": name}).encode(), local_pw)))
     try:
         os.chmod(LINK_AES, 0o600)
     except Exception:
         pass
-    save_state({"computer_id": computer_id, "pi_ident": pi_ident})
+    st = load_state()
+    devs = st.get("devices", {})
+    devs[name] = {"computer_id": computer_id, "pi_ident": pi_ident}
+    st["devices"] = devs
+    save_state(st)
 
 
 def pi_load_link(local_pw: str) -> dict:
