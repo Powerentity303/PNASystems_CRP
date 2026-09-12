@@ -43,9 +43,42 @@ def _chmod(p: Path) -> None:
         pass
 
 
+def _confirm_overwrite() -> bool:
+    if L.load_state().get("setup_done"):
+        ans = input("Already set up. Overwrite? [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("Keeping existing setup.")
+            return False
+    return True
+
+
+def _offer_cleanup(created: set[str]) -> None:
+    others: list[str] = []
+    for base in (SAFE, VAULT):
+        if not base.exists():
+            continue
+        for p in base.iterdir():
+            if p.is_file() and str(p) not in created:
+                others.append(p.name)
+    if not others:
+        return
+    print(f"Old files present: {', '.join(sorted(others))}")
+    if input("Delete old files? [y/N]: ").strip().lower() in ("y", "yes"):
+        for base in (SAFE, VAULT):
+            for p in base.iterdir():
+                if p.is_file() and str(p) not in created:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+        print("Old files deleted.")
+
+
 def cmd_setup() -> int:
     from pnasyscnct.link import base
 
+    if not _confirm_overwrite():
+        return 0
     _ensure()
     print("pnasyscrp setup (Pi)")
     fav_rest = input("Favorite restaurant: ").strip()
@@ -79,8 +112,10 @@ def cmd_setup() -> int:
         print(f"Register failed: {e}", file=sys.stderr)
         return 1
     L.save_state({"setup_done": True, "uuid2_ref": sha256_hex(uuid2)[:16]})
-    print("Setup complete. Access key (save this — your AI needs it):")
-    print(access)
+    print("Setup complete. Vault sealed (AES).")
+    print("Your device is registered. Use the device name you choose at")
+    print("`pnasyscrp ssh setup` from the computer side — no keys displayed here.")
+    _offer_cleanup({str(CREDS), str(PI_BLOB), str(ACCESS), str(L.STATE)})
     return 0
 
 
@@ -197,6 +232,10 @@ def cmd_ssh_setup() -> int:
     if not computer_id:
         print("Computer ID required.", file=sys.stderr)
         return 2
+    dev_name = input("Device name for this Pi (computer connects with it): ").strip()
+    if not dev_name:
+        print("Device name required.", file=sys.stderr)
+        return 2
     r = L.link_request(computer_id, blob)
     if not r.get("ok"):
         print(f"Pairing request failed: {r}", file=sys.stderr)
@@ -225,8 +264,8 @@ def cmd_ssh_setup() -> int:
     except Exception:
         print("Verify failed — wrong key?", file=sys.stderr)
         return 1
-    L.pi_save_link(computer_id, pi_ident, link_key, local_pw)
-    print("Linked and verified. Run: pnasyscrp ssh enable")
+    L.pi_save_link(computer_id, pi_ident, link_key, local_pw, name=dev_name)
+    print(f"Linked as '{dev_name}' and verified. Run: pnasyscrp ssh enable")
     return 0
 
 
