@@ -295,10 +295,16 @@ def cmd_ssh(name: str = "") -> int:
 
 
 def cmd_update() -> int:
+    import shutil
     import subprocess
     import tempfile
     import urllib.request
 
+    if sys.platform == "win32" or shutil.which("bash") is None:
+        # No usable bash: upgrade straight from PyPI (identical package).
+        print("Updating pnasyscnct from PyPI ...")
+        return subprocess.run([sys.executable, "-m", "pip", "install", "-U",
+                               "pnasyscnct"]).returncode
     owner = os.environ.get("PNA_OWNER", "Powerentity303")
     ref = os.environ.get("PNA_REF", "main")
     url = (f"https://raw.githubusercontent.com/{owner}/PNASystems_CRP/"
