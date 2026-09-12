@@ -52,14 +52,41 @@ def _collect(rid: str, wait_s: int) -> str:
 
 
 def _ensure_session() -> str | None:
+    """CHECK-3 + tombstone gate. Returns error text or None when verified."""
+    import secrets as _secrets
+
+    try:
+        t = L.check_deleted(PI_IDENT)
+    except Exception:
+        t = {}
+    if t.get("deleted"):
+        return (f"device deleted on Pi at {t.get('ts', '?')} — Pi ran delete. "
+                f"Remove locally with: pnasyscnct delete <device>")
+    nonce = _secrets.token_hex(16)
     try:
         r = L.ssh_join(COMPUTER_ID, PI_IDENT,
-                       secure_pack(LINK_KEY, {"hello": "mcp", "ts": int(time.time())}))
+                       secure_pack(LINK_KEY, {"hello": "mcp", "computer_id": COMPUTER_ID,
+                                              "nonce": nonce, "ts": int(time.time())}),
+                       fp=L.fingerprint(LINK_KEY))
     except Exception as e:
         return f"join failed: {e}"
+    if r.get("_http_error") == 403 or "fingerprint" in str(r.get("error", "")):
+        return ("join rejected: fingerprint mismatch — re-keyed elsewhere or MITM. "
+                "Re-pair if you rotated keys.")
     if r.get("_http_error"):
         return f"join http {r.get('_http_error')}"
-    return None
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        try:
+            a = L.api("GET", f"/api/ssh/ack?pi_ident={PI_IDENT}", timeout=25)
+        except Exception as e:
+            return f"ack read failed: {e}"
+        if a.get("ack"):
+            if a["ack"] == L.session_ack(nonce, LINK_KEY):
+                return None
+            return "Pi ack mismatch — wrong link key or impostor Pi."
+        time.sleep(4)
+    return "No ack from Pi (offline?)."
 
 
 def _run_op(op: dict, wait_s: int) -> str:
