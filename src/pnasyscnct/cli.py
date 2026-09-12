@@ -153,7 +153,16 @@ def cmd_setup_ssh() -> int:
     except Exception:
         print("Decrypt failed — wrong pairing key?", file=sys.stderr)
         return 1
+    # CHECK-1 (SAS): both humans must see the same code. Pi printed its SAS
+    # during `ssh setup`; compare before continuing.
+    print(f"CHECK-1 SAS (must match the Pi's screen): {L.sas(pair_key, inner.get('code', ''))}")
+    if input("SAS matches? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("Aborted — possible MITM. Start over with a fresh pairing key.", file=sys.stderr)
+        return 1
+    # CHECK-2 rides along: answer carries code echo + fingerprint; the Pi
+    # verifies both, and the server pins the fingerprint for this Pi.
     ans = secure_pack(pair_key, {"computer_id": computer_id, "link_key": new_key,
+                                 "code_echo": L.code_echo(inner.get("code", "")),
                                  "ok": True, "ts": int(time.time())})
     r = L.link_answer(computer_id, ans, for_pi=pi_ident)
     if not r.get("ok"):
@@ -255,6 +264,68 @@ def _stream_write(pi_ident: str, link_key: str, remote: str, raw: bytes) -> None
     print(f"streamed {len(raw)} bytes in {len(parts)} encrypted chunks (ok={ok})")
 
 
+def _tombstone_gate(pi_ident: str, name: str, interactive: bool) -> bool:
+    """True if blocked (Pi ran delete). Prompts removal when interactive."""
+    try:
+        t = L.check_deleted(pi_ident)
+    except Exception:
+        return False
+    if not t.get("deleted"):
+        return False
+    print(f"Connect failed: this Pi was DELETED on-device at {t.get('ts', '?')}.")
+    print("The Pi ran the delete command — its side is wiped and tombstoned.")
+    if interactive:
+        if input(f"Remove device '{name}' locally? [y/N]: ").strip().lower() in ("y", "yes"):
+            _remove_device_local(name)
+            print("Removed.")
+    else:
+        print(f"Run `pnasyscnct delete {name}` to remove it locally.")
+    return True
+
+
+def _remove_device_local(name: str) -> None:
+    from pnasys_ses import SecureEncryptionService as SES
+
+    try:
+        SES.DeleteEncryptedFile(L._link_slot(name))
+    except Exception:
+        pass
+    st = L.load_state()
+    devs = st.get("devices", {})
+    devs.pop(name, None)
+    st["devices"] = devs
+    L.save_state(st)
+
+
+def _join_verified(link: dict) -> str | None:
+    """CHECK-3: join with nonce+fp, verify Pi's ack. Returns error or None."""
+    import secrets as _secrets
+
+    nonce = _secrets.token_hex(16)
+    fp = L.fingerprint(link["link_key"])
+    r = L.ssh_join(link["computer_id"], link["pi_ident"],
+                   secure_pack(link["link_key"],
+                               {"hello": "pc", "computer_id": link["computer_id"],
+                                "nonce": nonce, "ts": int(time.time())}), fp=fp)
+    if r.get("_http_error") == 403 or "fingerprint" in str(r.get("error", "")):
+        return ("Join rejected: fingerprint mismatch — someone re-keyed this Pi "
+                "or a MITM is replaying. Re-pair if you rotated keys.")
+    if r.get("_http_error"):
+        return f"join http {r.get('_http_error')}"
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        try:
+            a = L.ssh_ack_get(link["pi_ident"])
+        except Exception as e:
+            return f"ack read failed: {e}"
+        if a.get("ack"):
+            if a["ack"] == L.session_ack(nonce, link["link_key"]):
+                return None
+            return "Pi ack mismatch — wrong link key or impostor Pi."
+        time.sleep(4)
+    return "No ack from Pi (offline, or join claim raced — retry)."
+
+
 def cmd_ssh(name: str = "") -> int:
     import hmac
 
@@ -275,14 +346,18 @@ def cmd_ssh(name: str = "") -> int:
     except Exception:
         print("Vault entry missing. Re-link with: pnasyscnct setup --ssh", file=sys.stderr)
         return 2
+    if _tombstone_gate(link["pi_ident"], name, interactive=True):
+        return 1
     typed = getpass.getpass("Link encryption key: ")
     if not typed or not hmac.compare_digest(typed, link["link_key"]):
         print("Wrong encryption key.", file=sys.stderr)
         return 1
     del typed
-    L.ssh_join(link["computer_id"], link["pi_ident"],
-               secure_pack(link["link_key"], {"hello": "pc", "ts": int(time.time())}))
-    print(f"Session open to '{name}'. Reconnects automatically on failure.")
+    err = _join_verified(link)
+    if err:
+        print(f"Session failed: {err}", file=sys.stderr)
+        return 1
+    print(f"Session open to '{name}' (mutually verified). Reconnects automatically.")
     while True:
         rc = _shell(link["pi_ident"], link["link_key"])
         if rc == 0:
@@ -292,6 +367,64 @@ def cmd_ssh(name: str = "") -> int:
             time.sleep(5)
         except KeyboardInterrupt:
             return 130
+
+
+def cmd_delete(name: str = "") -> int:
+    pw, _me = _unlock()
+    devs = L.pc_devices()
+    if not name:
+        print(f"Usage: pnasyscnct delete <device>. Linked: {', '.join(sorted(devs)) or 'none'}.",
+              file=sys.stderr)
+        return 2
+    if name not in devs:
+        print(f"Unknown device '{name}'.", file=sys.stderr)
+        return 2
+    meta = devs[name]
+    try:
+        link = L.pc_load_link(pw, name)
+        fp = L.fingerprint(link["link_key"])
+    except Exception:
+        fp = ""
+    if input(f"Delete device '{name}' (local files + GitHub queue/presence)? [y/N]: "
+             ).strip().lower() not in ("y", "yes"):
+        print("Aborted.")
+        return 2
+    try:
+        r = L.purge(meta["pi_ident"], fp=fp)
+        print(f"GitHub purge: {'ok' if r.get('ok') else r}")
+    except Exception as e:
+        print(f"Purge failed: {e}", file=sys.stderr)
+    _remove_device_local(name)
+    print(f"Device '{name}' deleted.")
+    return 0
+
+
+def cmd_clearconnections() -> int:
+    pw, _me = _unlock()
+    devs = L.pc_devices()
+    if not devs:
+        print("No connections.")
+        return 0
+    print(f"This drops ALL connections: {', '.join(sorted(devs))}")
+    if input("Type YES to confirm: ").strip() != "YES":
+        print("Aborted.")
+        return 2
+    for name in sorted(devs):
+        try:
+            link = L.pc_load_link(pw, name)
+            fp = L.fingerprint(link["link_key"])
+            pi = link["pi_ident"]
+        except Exception:
+            fp, pi = "", devs[name].get("pi_ident", "")
+        try:
+            if pi:
+                L.purge(pi, fp=fp)
+        except Exception as e:
+            print(f"purge {name} failed: {e}")
+        _remove_device_local(name)
+        print(f"  cleared {name}")
+    print("All connections cleared.")
+    return 0
 
 
 def cmd_update() -> int:
@@ -372,7 +505,7 @@ def cmd_selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print("Usage: pnasyscnct {setup [--ssh]|ssh [DEVICE]|mcp --enckey KEY [--sshdev DEV]|selftest|update}")
+        print("Usage: pnasyscnct {setup [--ssh]|ssh [DEVICE]|mcp --enckey KEY [--sshdev DEV]|selftest|update|delete DEVICE|clearconnections}")
         return 0
     if argv[0] == "setup" and "--ssh" in argv[1:]:
         return cmd_setup_ssh()
@@ -381,6 +514,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv[0] == "ssh":
         rest = [a for a in argv[1:] if not a.startswith("-")]
         return cmd_ssh(rest[0] if rest else "")
+    if argv[0] == "delete":
+        rest = [a for a in argv[1:] if not a.startswith("-")]
+        return cmd_delete(rest[0] if rest else "")
+    if argv[0] == "clearconnections":
+        return cmd_clearconnections()
     if argv[0] == "update":
         return cmd_update()
     if argv[0] == "mcp":
