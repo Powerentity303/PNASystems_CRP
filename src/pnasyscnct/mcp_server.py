@@ -89,6 +89,11 @@ def _t_ssh_write(a: dict) -> str:
                    int(a.get("wait_s", 120) or 120))
 
 
+def _t_ssh_install(a: dict) -> str:
+    return _run_op({"kind": "install", "pkg": str(a.get("pkg", ""))[:256]},
+                   int(a.get("wait_s", 300) or 300))
+
+
 def _t_ssh_write_stream(a: dict) -> str:
     err = _ensure_session()
     if err:
@@ -126,6 +131,7 @@ _HANDLERS = {
     "ssh_read": _t_ssh_read,
     "ssh_write": _t_ssh_write,
     "ssh_write_stream": _t_ssh_write_stream,
+    "ssh_install": _t_ssh_install,
     "ssh_reconnect": _t_ssh_reconnect,
     "ssh_status": _t_ssh_status,
 }
@@ -147,6 +153,10 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "path": {"type": "string"}, "data_b64": {"type": "string"},
          "wait_s": {"type": "integer", "default": 300}}, "required": ["path", "data_b64"]}},
+    {"name": "ssh_install", "description": "apt-install a package on the Pi.",
+     "inputSchema": {"type": "object", "properties": {
+         "pkg": {"type": "string"},
+         "wait_s": {"type": "integer", "default": 300}}, "required": ["pkg"]}},
     {"name": "ssh_reconnect", "description": "Force SSH session rejoin.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "ssh_status", "description": "Pi presence/heartbeat status.",
