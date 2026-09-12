@@ -70,8 +70,8 @@ def cmd_setup() -> int:
     fav_animal = input("Favorite animal: ").strip()
     fav_color = input("Favorite color: ").strip()
     pc_user = input("Computer username: ").strip()
-    pc_pass = getpass.getpass("Computer password: ")
-    local_pw = getpass.getpass("Local encryption password (anything): ")
+    pc_pass = _getpass("Computer password: ")
+    local_pw = _getpass("Local encryption password (anything): ")
     if not all([fav_rest, fav_animal, fav_color, pc_user, pc_pass, local_pw]):
         print("All fields required.", file=sys.stderr)
         return 2
@@ -98,21 +98,47 @@ def cmd_setup() -> int:
     return 0
 
 
+def _input(prompt: str) -> str:
+    """input() that treats Ctrl+C / Ctrl+Z and embedded ^C as cancel."""
+    try:
+        s = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if "\x03" in s or "\x04" in s:
+        raise KeyboardInterrupt
+    return s.strip()
+
+
+def _getpass(prompt: str) -> str:
+    """getpass that can't swallow Ctrl+C (Windows msvcrt eats 0x03)."""
+    try:
+        s = _getpass(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if "\x03" in s or "\x04" in s:
+        raise KeyboardInterrupt
+    return s
+
+
 def _unlock() -> tuple[str, dict]:
     """Prompt local pw; return (pw, {"computer_id": ...}). Never prints secrets."""
     from pnasys_ses import SecureEncryptionService as SES
 
-    pw = getpass.getpass("Local encryption password: ")
+    pw = _getpass("Local encryption password: ")
     try:
-        link = json.loads(SES.DecryptEncryptedFile("cnct_link", pw))
+        link = json.loads(SES.DecryptEncryptedFile("cnct_link:default", pw))
         print("Vault unlocked (linked).")
         return pw, link
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception:
         pass
     try:
         me = json.loads(SES.DecryptEncryptedFile("cnct_self", pw))
         print("Vault unlocked.")
         return pw, me
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception:
         print("Wrong password or no setup. Run: pnasyscnct setup", file=sys.stderr)
         sys.exit(2)
@@ -125,7 +151,8 @@ def cmd_setup_ssh() -> int:
     if not computer_id:
         print("No computer ID. Run: pnasyscnct setup", file=sys.stderr)
         return 2
-    print(f"Scanning for Pi pairing requests (computer {computer_id[:8]}...). Ctrl+C to stop.")
+    print(f"Scanning for Pi pairing requests. Ctrl+C to stop.")
+    print(f"YOUR COMPUTER ID (the Pi must type exactly this): {computer_id}")
     req = None
     while req is None:
         try:
@@ -141,9 +168,9 @@ def cmd_setup_ssh() -> int:
             continue
         req = r
     print("Pairing request received.")
-    dev_name = input("Device name for this Pi: ").strip() or "default"
-    pair_key = getpass.getpass("Pairing encryption key (the one entered on the Pi): ")
-    new_key = getpass.getpass("NEW link encryption key (choose now, Pi will adopt it): ")
+    dev_name = _input("Device name for this Pi: ") or "default"
+    pair_key = _getpass("Pairing encryption key (the one entered on the Pi): ")
+    new_key = _getpass("NEW link encryption key (choose now, Pi will adopt it): ")
     if not new_key:
         print("A new link key is required.", file=sys.stderr)
         return 2
@@ -348,7 +375,7 @@ def cmd_ssh(name: str = "") -> int:
         return 2
     if _tombstone_gate(link["pi_ident"], name, interactive=True):
         return 1
-    typed = getpass.getpass("Link encryption key: ")
+    typed = _getpass("Link encryption key: ")
     if not typed or not hmac.compare_digest(typed, link["link_key"]):
         print("Wrong encryption key.", file=sys.stderr)
         return 1
@@ -504,6 +531,14 @@ def cmd_selftest() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    try:
+        return _dispatch(argv)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 130
+
+
+def _dispatch(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help", "help"):
         print("Usage: pnasyscnct {setup [--ssh]|ssh [DEVICE]|mcp --enckey KEY [--sshdev DEV]|selftest|update|delete DEVICE|clearconnections}")
         return 0
