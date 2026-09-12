@@ -132,6 +132,9 @@ def _run_install(msg: dict) -> dict:
 def _pack(key: str, resp: dict) -> dict:
     raw = resp.pop("_stream_raw", None)
     if raw is not None:
+        if len(raw) > 8_000_000:
+            return {"id": resp.get("id", ""),
+                    "error": "too large for one secure envelope; split the file"}
         resp = dict(resp)
         resp["data_b64"] = base64.b64encode(raw).decode("ascii")
         resp["stream"] = True
