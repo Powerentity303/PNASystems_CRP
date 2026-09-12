@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnasyscnct"
+version = "0.2.0"
+description = "PNASystems Connect — tailscale-style Pi remote: computer + Pi, SSH over queue, MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=41", "pnasys-encryption-service>=1.12", "pnasys-ses>=0.1.0"]
+authors = [{name="PNASystems"}]
+
+[project.urls]
+Homepage = "https://github.com/Powerentity303/PNASystems_CRP"
+Repository = "https://github.com/Powerentity303/PNASystems_CRP"
+
+[project.scripts]
+pnasyscnct = "pnasyscnct.cli:main"
+pnasyscrp = "pnasyscnct.pi_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
