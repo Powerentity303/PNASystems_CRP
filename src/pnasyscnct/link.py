@@ -51,6 +51,27 @@ def ident_of(access_key: str) -> str:
     return hashlib.sha256(access_key.encode()).hexdigest()
 
 
+def fingerprint(link_key: str) -> str:
+    """Public fingerprint of a link key (safe to store server-side)."""
+    return hashlib.sha256(("fp|" + link_key).encode()).hexdigest()
+
+
+def sas(pair_key: str, code: str) -> str:
+    """CHECK-1: short auth string both humans compare (anti-MITM)."""
+    h = hashlib.sha256((pair_key + "|" + code).encode()).hexdigest()[:12]
+    return f"{h[0:4]}-{h[4:8]}-{h[8:12]}".upper()
+
+
+def code_echo(code: str) -> str:
+    """CHECK-2: proves the other side decrypted our message."""
+    return hashlib.sha256(("echo|" + code).encode()).hexdigest()
+
+
+def session_ack(nonce: str, link_key: str) -> str:
+    """CHECK-3: per-session proof of key possession (no key revealed)."""
+    return hashlib.sha256((nonce + "|" + link_key).encode()).hexdigest()
+
+
 def load_state() -> dict:
     try:
         return json.loads(STATE.read_text())
@@ -156,13 +177,54 @@ def ssh_status(pi_ident: str) -> dict:
     return api("GET", f"/api/ssh/status?pi_ident={pi_ident}", timeout=25)
 
 
-def ssh_join(computer_id: str, pi_ident: str, blob: str) -> dict:
-    return api("POST", "/api/ssh/join", {"computer_id": computer_id,
-                                         "pi_ident": pi_ident, "blob": blob})
+def ssh_join(computer_id: str, pi_ident: str, blob: str, fp: str = "") -> dict:
+    body: dict = {"computer_id": computer_id, "pi_ident": pi_ident, "blob": blob}
+    if fp:
+        body["fp"] = fp
+    return api("POST", "/api/ssh/join", body)
 
 
 def ssh_wait_join(pi_ident: str) -> dict:
     return api("GET", f"/api/ssh/wait?pi_ident={pi_ident}", timeout=65)
+
+
+def ssh_ack_post(pi_ident: str, ack: str) -> dict:
+    return api("POST", "/api/ssh/ack", {"pi_ident": pi_ident, "ack": ack})
+
+
+def ssh_ack_get(pi_ident: str) -> dict:
+    return api("GET", f"/api/ssh/ack?pi_ident={pi_ident}", timeout=25)
+
+
+def check_deleted(pi_ident: str) -> dict:
+    return api("GET", f"/api/check-deleted?pi_ident={pi_ident}", timeout=25)
+
+
+def purge(pi_ident: str, access_key: str = "", fp: str = "") -> dict:
+    body: dict = {"pi_ident": pi_ident}
+    if access_key:
+        body["access_key"] = access_key
+    if fp:
+        body["fp"] = fp
+    return api("POST", "/api/purge", body)
+
+
+def mark_deleted(pi_ident: str, access_key: str = "", fp: str = "") -> dict:
+    body: dict = {"pi_ident": pi_ident}
+    if access_key:
+        body["access_key"] = access_key
+    if fp:
+        body["fp"] = fp
+    return api("POST", "/api/mark-deleted", body)
+
+
+def reset_pin(pi_ident: str, what: str = "all", access_key: str = "", fp: str = "") -> dict:
+    body: dict = {"pi_ident": pi_ident, "what": what}
+    if access_key:
+        body["access_key"] = access_key
+    if fp:
+        body["fp"] = fp
+    return api("POST", "/api/link/reset", body)
 
 
 def enqueue(access_key: str, kind: str, fields: dict, rid: str | None = None) -> dict:
