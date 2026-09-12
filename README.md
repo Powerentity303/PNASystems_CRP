@@ -18,24 +18,25 @@ This gives you **both** commands: `pnasyscnct` (computer) and `pnasyscrp` (Pi).
 ```bash
 pnasyscnct setup            # same questions + TPM-sealed vault, prints computer ID
 pnasyscnct setup --ssh      # scan for the Pi's pairing request, verify, rotate link key
-pnasyscnct ssh              # remote shell (reconnects on loss)
-pnasyscnct mcp --enckey K   # MCP server (OpenCode), SSH always active
+pnasyscnct ssh MyPi         # asks link encryption key, remote shell (reconnects)
+pnasyscnct mcp --enckey K --sshdev MyPi   # MCP server (OpenCode), SSH always active
+pnasyscnct update           # reinstall latest (cache-busted)
 ```
 
 OpenCode (`opencode.json`):
 
 ```json
 {"mcp": {"pnasys-ssh": {"type": "local",
-  "command": ["pnasyscnct", "mcp", "--enckey", "LINK_KEY"],
+  "command": ["pnasyscnct", "mcp", "--enckey", "LINK_KEY", "--sshdev", "MyPi"],
   "enabled": true}}}
 ```
 
 ## Pi
 
 ```bash
-pnasyscrp setup             # identity + AES vault, prints access key
+pnasyscrp setup             # identity + AES vault (overwrite confirm, old-file cleanup)
 pnasyscrp enable            # listener + fresh session key (10-min idle auto-off)
-pnasyscrp ssh setup         # pairing: key first, code issued, enter computer ID
+pnasyscrp ssh setup         # pairing: key first, code issued, computer ID + device name
 pnasyscrp ssh enable        # presence + listener (root-aware exec)
 pnasyscrp update            # reinstall latest (cache-busted)
 ```
