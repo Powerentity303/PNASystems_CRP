@@ -43,6 +43,26 @@ def _chmod(p: Path) -> None:
         pass
 
 
+def _input(prompt: str) -> str:
+    try:
+        s = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if "\x03" in s or "\x04" in s:
+        raise KeyboardInterrupt
+    return s.strip()
+
+
+def _getpass(prompt: str) -> str:
+    try:
+        s = _getpass(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if "\x03" in s or "\x04" in s:
+        raise KeyboardInterrupt
+    return s
+
+
 def _confirm_overwrite() -> bool:
     if L.load_state().get("setup_done"):
         ans = input("Already set up. Overwrite? [y/N]: ").strip().lower()
@@ -85,8 +105,8 @@ def cmd_setup() -> int:
     fav_animal = input("Favorite animal: ").strip()
     fav_color = input("Favorite color: ").strip()
     pi_user = input("Raspberry Pi username: ").strip()
-    pi_pass = getpass.getpass("Raspberry Pi password: ")
-    local_pw = getpass.getpass("Local encryption password (anything): ")
+    pi_pass = _getpass("Raspberry Pi password: ")
+    local_pw = _getpass("Local encryption password (anything): ")
     if not all([fav_rest, fav_animal, fav_color, pi_user, pi_pass, local_pw]):
         print("All fields required.", file=sys.stderr)
         return 2
@@ -120,7 +140,7 @@ def cmd_setup() -> int:
 
 
 def _load_access() -> tuple[str, str]:
-    pw = getpass.getpass("Local encryption password: ")
+    pw = _getpass("Local encryption password: ")
     return decrypt_local(json.loads(ACCESS.read_text()), pw).decode(), pw
 
 
@@ -225,7 +245,7 @@ def cmd_ssh_setup() -> int:
         return 2
     access, local_pw = _load_access()
     pi_ident = sha256_hex(access)
-    pair_key = getpass.getpass("Pairing encryption key (tell the computer this): ")
+    pair_key = _getpass("Pairing encryption key (tell the computer this): ")
     if not pair_key:
         print("Pairing key required.", file=sys.stderr)
         return 2
@@ -263,7 +283,7 @@ def cmd_ssh_setup() -> int:
         if r.get("empty"):
             continue
         ans = r
-    check = getpass.getpass("Computer answered. Enter pairing key to decrypt + verify: ")
+    check = _getpass("Computer answered. Enter pairing key to decrypt + verify: ")
     try:
         inner = secure_unpack(check, ans["blob"])
         assert inner.get("computer_id") == computer_id and inner.get("ok")
@@ -344,6 +364,14 @@ def cmd_ssh_enable() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 130
+
+
+def _main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help", "help"):
         print("Usage: pnasyscrp {setup|enable|disable|revokeapi|selftest|update|delete|ssh setup|ssh enable}")
         return 0
@@ -355,7 +383,6 @@ def main(argv: list[str] | None = None) -> int:
             "revokeapi": cmd_revokeapi, "selftest": cmd_selftest,
             "update": cmd_update, "delete": cmd_delete}.get(argv[0], lambda: (print(f"Unknown: {argv[0]}",
                                                               file=sys.stderr), 2)[1])()
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
