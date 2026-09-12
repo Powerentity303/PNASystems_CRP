@@ -146,7 +146,7 @@ def poll():
             return jsonify({"error": "unknown ident"}), 403
         entries: list = []
         name = ""
-        for _ in range(6):
+        for _ in range(5):
             entries = gs.list_dir(cfg["queue"], "queue", cfg["token"], cfg["qb"])
             cands = [e["name"] for e in entries
                      if e.get("type") == "file" and e["name"].startswith(ident + "-")
@@ -333,7 +333,7 @@ def link_poll():
         cid = str(request.args.get("computer_id", ""))
         if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", cid):
             return jsonify({"error": "bad computer_id"}), 400
-        for _ in range(12):
+        for _ in range(10):
             raw = gs.get_file(cfg["queue"], f"link_req/{cid}.json", cfg["token"], cfg["qb"])
             if raw is not None:
                 gs.delete_file(cfg["queue"], f"link_req/{cid}.json",
@@ -476,7 +476,7 @@ def ssh_wait():
         pi = str(request.args.get("pi_ident", ""))
         if not re.fullmatch(r"[0-9a-f]{64}", pi):
             return jsonify({"error": "bad pi_ident"}), 400
-        for _ in range(12):
+        for _ in range(10):
             raw = gs.get_file(cfg["queue"], f"ssh/{pi}-join.json", cfg["token"], cfg["qb"])
             if raw is not None:
                 gs.delete_file(cfg["queue"], f"ssh/{pi}-join.json",
@@ -523,8 +523,13 @@ def ssh_ack_get():
         return jsonify({"error": _redact(e)[:200]}), 500
 
 
-def _auth_pi(cfg: dict, pi: str, access_key: str, fp: str) -> bool:
-    """True if access_key owns this ident OR fp matches the pinned fp."""
+def _auth_pi(cfg: dict, pi: str, access_key: str, fp: str, allow_unpinned_purge: bool = False) -> bool:
+    """True if access_key owns this ident OR fp matches the pinned fp.
+
+    allow_unpinned_purge (purge only): with no pin on record, any well-formed
+    fp authorizes debris cleanup — heartbeats rewrite within a minute anyway,
+    so there is nothing to gain by blocking it.
+    """
     if access_key:
         try:
             _check_registered(cfg, access_key)
@@ -533,6 +538,8 @@ def _auth_pi(cfg: dict, pi: str, access_key: str, fp: str) -> bool:
             return False
     if fp and re.fullmatch(r"[0-9a-f]{64}", fp):
         raw = gs.get_file(cfg["queue"], f"link_fp/{pi}.json", cfg["token"], cfg["kb"])
+        if raw is None:
+            return allow_unpinned_purge
         try:
             return bool(raw) and json.loads(raw.decode()).get("fp", "") == fp
         except Exception:
@@ -587,7 +594,8 @@ def purge():
         pi = str(data.get("pi_ident", ""))
         if not re.fullmatch(r"[0-9a-f]{64}", pi):
             return jsonify({"error": "bad pi_ident"}), 400
-        if not _auth_pi(cfg, pi, str(data.get("access_key", "")), str(data.get("fp", ""))):
+        if not _auth_pi(cfg, pi, str(data.get("access_key", "")), str(data.get("fp", "")),
+                         allow_unpinned_purge=True):
             return jsonify({"error": "not authorized"}), 403
         n = 0
         for directory, prefix, suffix in (
